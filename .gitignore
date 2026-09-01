@@ -1,0 +1,34 @@
+node_modules/
+.next/
+out/
+build/
+dist/
+
+.env
+.env.local
+.env*.local
+!.env.example
+
+*.log
+npm-debug.log*
+.DS_Store
+.vscode/
+.idea/
+
+# Prisma generated client
+prisma/generated/
+
+# Local database. Holds every scraped company and contact - business data, not
+# source - and is ~76MB of binary that would bloat every clone.
+.pgdata/
+
+# Exports and working files
+export-data.json
+*.xlsx
+revenue-agent-package/
+
+# Credentials must never be here. Service-account keys live outside the repo
+# entirely (see SETUP.md), but belt and braces.
+*.pem
+*-key.json
+service-account*.json

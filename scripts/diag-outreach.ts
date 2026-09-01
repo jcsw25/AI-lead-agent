@@ -1,0 +1,16 @@
+import { db } from "@/lib/db";
+const b = await db.business.findFirstOrThrow({ orderBy: { createdAt: "asc" } });
+const r = b as unknown as Record<string, unknown>;
+console.log(`business      ${b.name}`);
+console.log(`replyTo       ${r.replyToEmail ?? "(NOT SET — gate blocks all sends)"}`);
+console.log(`EMAIL_ADAPTER ${process.env.EMAIL_ADAPTER ?? "(unset)"}`);
+console.log(`\nmailboxes     ${await db.mailbox.count()}`);
+console.log(`sendPolicy    ${await db.sendPolicy.count()}`);
+console.log(`campaigns     ${await db.campaign.count()}`);
+console.log(`messages      ${await db.message.count()}`);
+console.log(`sendLedger    ${await db.sendLedgerEntry.count()}`);
+console.log(`suppressions  ${await db.suppressionEntry.count()}`);
+console.log(`introductions ${await db.introduction.count()}`);
+const approved = await db.introduction.count({ where: { status: "APPROVED" } });
+console.log(`  approved    ${approved}`);
+await db.$disconnect();

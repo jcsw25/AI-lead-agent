@@ -1,0 +1,12 @@
+import { db } from "@/lib/db";
+const biz = await db.business.findFirstOrThrow({ orderBy: { createdAt: "asc" }, include: { sendPolicy: true, mailboxes: true } });
+console.log(`business name     ${biz.name}`);
+console.log(`sender name       ${biz.sendPolicy?.senderName ?? "(not set)"}`);
+console.log(`reply-to          ${biz.sendPolicy?.senderContactEmail ?? "(not set)"}`);
+console.log(`sender phone      ${biz.sendPolicy?.senderContactPhone ?? "(not set)"}`);
+console.log(`postal address    ${biz.sendPolicy?.senderPostalAddr ?? "(not set)"}`);
+console.log(`daily send cap    ${biz.sendPolicy?.dailySendCap}`);
+console.log(`bulk threshold    ${biz.sendPolicy?.bulkPer24h}/24h`);
+console.log(`mailbox           ${biz.mailboxes.map((m) => `${m.address} (${m.provider})`).join(", ") || "none"}`);
+console.log(`sent all time     ${await db.sendLedgerEntry.count()}`);
+await db.$disconnect();

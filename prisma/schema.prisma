@@ -1,0 +1,2146 @@
+// AI Revenue Department - data model
+// Postgres (Neon/Supabase). See docs/02-data-model.md for the narrative.
+//
+// Three structural rules this schema enforces:
+//   1. TENANCY      - Business is the tenant. Company/Contact are GLOBAL canonical
+//                     records; Prospect is the tenant-scoped pursuit of a Company.
+//   2. PROVENANCE   - every externally-asserted fact carries sourceUrl + observedAt
+//                     + the AgentRun that extracted it. No provenance => cannot
+//                     raise a lead score and cannot enter an outbound message.
+//   3. GEO-NEUTRAL  - no Singapore-specific column exists. Region, SeasonalWindow
+//                     and CompanyIdentifier.scheme are DATA, not schema.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")        // pooled (PgBouncer) - app queries
+  directUrl = env("DIRECT_DATABASE_URL") // direct :5432 - migrations + pg-boss
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+
+enum Autonomy {
+  MANUAL // AI proposes, human does everything
+  APPROVE_EACH // AI drafts, human approves each item  <- MVP default
+  APPROVE_BATCH // AI drafts, human approves a batch
+  AUTOPILOT // AI executes, human audits after the fact
+}
+
+enum ProspectStage {
+  DISCOVERED
+  RESEARCHING
+  QUALIFIED
+  CONTACT_IDENTIFIED
+  QUEUED
+  CONTACTED
+  ENGAGED
+  MEETING
+  OPPORTUNITY
+  WON
+  LOST
+  DISQUALIFIED
+  SUPPRESSED
+}
+
+enum LeadTier {
+  HOT // 80-100
+  WARM // 50-79
+  COLD // 0-49
+}
+
+enum SignalType {
+  SEASONAL
+  CORPORATE_EVENT
+  EXPANSION
+  NEW_LOCATION
+  LEADERSHIP_CHANGE
+  FUNDING
+  ACQUISITION
+  HIRING
+  NEW_CONTRACT
+  PRODUCT_LAUNCH
+  RENOVATION
+  ANNIVERSARY
+  AWARD
+  PARTNERSHIP
+  REGULATORY
+  OTHER
+}
+
+enum VerificationStatus {
+  VERIFIED // retrieved from a citable source
+  INFERRED // model-derived from verified inputs; usable, marked as such
+  UNVERIFIED // no source - cannot score, cannot be used in outbound copy
+  STALE // was verified, past its freshness horizon
+  REFUTED
+}
+
+enum Channel {
+  EMAIL
+  LINKEDIN
+  PHONE
+  WHATSAPP
+  IN_PERSON
+  OTHER
+}
+
+enum Direction {
+  OUTBOUND
+  INBOUND
+}
+
+enum MessageStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  SCHEDULED
+  SENDING
+  SENT
+  DELIVERED
+  BOUNCED
+  FAILED
+  BLOCKED_BY_GATE
+  CANCELLED
+}
+
+enum ReplyClass {
+  HOT
+  WARM
+  COLD
+  NEGATIVE
+  UNSURE
+  OUT_OF_OFFICE
+  WRONG_CONTACT
+  UNSUBSCRIBE
+  AUTO_REPLY
+  BOUNCE
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EDITED_AND_APPROVED
+  EXPIRED
+}
+
+enum SuppressionScope {
+  BUSINESS // this tenant may not contact
+  GLOBAL // no tenant may contact (hard opt-out, complaint, legal)
+}
+
+enum SuppressionReason {
+  UNSUBSCRIBE
+  MANUAL
+  BOUNCE_HARD
+  COMPLAINT
+  DNC_REGISTRY
+  COMPETITOR
+  EXISTING_CUSTOMER
+  LEGAL_REQUEST
+}
+
+// The six lanes the Industry Scout explores. Structuring the search this way is
+// what produces non-obvious targets: without lanes a model returns the same
+// three adjacent industries every time. SEASONAL is the "flower shops before
+// Valentine's Day" lane - the customer's OWN peak creates the demand for you.
+enum PlayLane {
+  DIRECT // obvious buyers of what we sell
+  ADJACENT // one step removed from the obvious
+  SEASONAL // their peak season creates our opportunity
+  TRIGGER // industries undergoing change right now
+  CHANNEL // they resell, bundle or refer us
+  CONTRARIAN // nobody in our category targets them
+}
+
+// A brokered introduction moves through these. INTRODUCED is the moment the
+// two sides are put in contact - the point commission becomes claimable.
+enum MatchStatus {
+  PROPOSED // agent suggested it, nobody has approved
+  APPROVED // operator agreed it is worth pitching
+  PITCHED // outreach sent to the buyer
+  INTERESTED // buyer replied positively
+  INTRODUCED // both sides connected
+  NEGOTIATING
+  WON
+  LOST
+}
+
+// Products and services broker differently. A product has a price you can quote
+// cold; a service has a price only after you understand the problem. That single
+// difference changes the match logic, the first ask, and the deal shape - so the
+// kind is explicit rather than inferred from whether a price happens to be set.
+enum OfferingKind {
+  PRODUCT // physical goods - priced per unit, quotable cold
+  SERVICE // expertise - scoped after discovery, priced per engagement
+}
+
+enum RateType {
+  FIXED_PRICE // per unit
+  PROJECT // fixed fee for a defined scope
+  DAY_RATE
+  HOURLY
+  RETAINER // recurring monthly
+}
+
+enum CommissionModel {
+  PERCENT // % of deal value
+  FLAT // fixed fee per introduction or deal
+  MARKUP // we buy and resell at a margin
+  NONE // own product, full revenue
+}
+
+enum AgentName {
+  BUSINESS_ANALYST
+  QUERY_STRATEGIST
+  INDUSTRY_SCOUT
+  ICP
+  PROSPECT_HUNTER
+  COMPANY_RESEARCH
+  MATCHMAKER
+  SOLUTION_DESIGNER
+  SUPPLIER_RECRUITER
+  PAIRING_SCOUT
+  OPPORTUNITY
+  LEAD_SCORING
+  VALUE_PROP
+  CAMPAIGN
+  OUTREACH
+  CONVERSATION
+  CRM
+  PERFORMANCE
+  STRATEGY
+}
+
+enum RunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  REFUSED // stop_reason: "refusal"
+  INVALID_OUTPUT // schema validation failed
+  TIMEOUT
+  CANCELLED
+}
+
+enum TaskStatus {
+  OPEN
+  DONE
+  SNOOZED
+  CANCELLED
+}
+
+enum DealStage {
+  OPEN
+  PROPOSAL
+  NEGOTIATION
+  WON
+  LOST
+}
+
+enum RecommendationStatus {
+  NEW
+  VIEWED
+  ACCEPTED
+  DISMISSED
+  EXPIRED
+}
+
+// Where a company record came from. Provenance at the source level, on top of
+// the per-field provenance in Claim.
+enum LeadSource {
+  SCRAPE // crawled from the company's own website
+  SEARCH // found via web search, then scraped
+  MANUAL // typed in or pasted
+  CSV_IMPORT
+  REFERRAL
+}
+
+enum SupplierLeadStatus {
+  IDENTIFIED // scraped, not yet approached
+  ENRICHED // contact details confirmed
+  CONTACTED // recruitment email sent
+  INTERESTED // replied positively
+  ONBOARDED // now a Supplier we can broker for
+  DECLINED
+  UNREACHABLE // no contact route found
+}
+
+enum IdentifierScheme {
+  UEN // Singapore
+  ABN // Australia
+  ACN // Australia
+  CRN // UK/HK
+  EIN // US
+  VAT
+  DUNS
+  LINKEDIN_ID
+  OTHER
+}
+
+// ---------------------------------------------------------------------------
+// TENANCY
+// ---------------------------------------------------------------------------
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+
+  memberships BusinessMember[]
+  approvals   Approval[]
+
+  @@map("users")
+}
+
+model Business {
+  id         String   @id @default(cuid())
+  name       String
+  websiteUrl String?
+  regionId   String
+  autonomy   Autonomy @default(APPROVE_EACH)
+
+  // Live Google Sheet mirror of the database. The Sheet is a view; Postgres
+  // stays authoritative (suppression especially — see docs/04-compliance.md).
+  sheetId       String?
+  sheetUrl      String?
+  sheetSyncedAt DateTime?
+  sheetAutoSync Boolean   @default(true)
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  region          Region             @relation(fields: [regionId], references: [id])
+  members         BusinessMember[]
+  profile         BusinessProfile?
+  offerings       Offering[]
+  icps            Icp[]
+  prospects       Prospect[]
+  campaigns       Campaign[]
+  messages        Message[]
+  threads         Thread[]
+  tasks           Task[]
+  meetings        Meeting[]
+  deals           Deal[]
+  suppressions    SuppressionEntry[]
+  sendPolicy      SendPolicy?
+  sendLedger      SendLedgerEntry[]
+  scoringModels   ScoringModel[]
+  recommendations Recommendation[]
+  agentRuns       AgentRun[]
+  auditLogs       AuditLog[]
+  mailboxes       Mailbox[]
+  valueProps      ValueProposition[]
+  approvals       Approval[]
+  outcomeStats    OutcomeStat[]
+  industryPlays   IndustryPlay[]
+  suppliers       Supplier[]
+  matches         Match[]
+  discoveryCalls  DiscoveryCall[]
+  proposals       SolutionProposal[]
+  pairings        Pairing[]
+  supplierLeads   SupplierLead[]
+  scrapeRuns      ScrapeRun[]
+  qualifications  Qualification[]
+  introductions   Introduction[]
+  matchmakes      Matchmake[]
+  needs           Need[]
+  changeLog       ChangeLog[]
+
+  @@index([regionId])
+  @@map("businesses")
+}
+
+model BusinessMember {
+  id         String @id @default(cuid())
+  businessId String
+  userId     String
+  role       String @default("owner") // owner | admin | member
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, userId])
+  @@map("business_members")
+}
+
+// Geo-neutrality: markets are rows, never enum members or hardcoded logic.
+model Region {
+  id       String  @id @default(cuid())
+  code     String  @unique // "SG", "AU", "AU-NSW"
+  name     String
+  timezone String // "Asia/Singapore"
+  currency String // "SGD"
+  locale   String  @default("en-SG")
+  parentId String?
+
+  parent     Region?          @relation("RegionTree", fields: [parentId], references: [id])
+  children   Region[]         @relation("RegionTree")
+  businesses Business[]
+  companies  Company[]
+  seasons    SeasonalWindow[]
+  rules      ComplianceRule[]
+
+  @@map("regions")
+}
+
+// ---------------------------------------------------------------------------
+// BUSINESS INTELLIGENCE (spec section 1)
+// ---------------------------------------------------------------------------
+
+model BusinessProfile {
+  id         String @id @default(cuid())
+  businessId String @unique
+
+  // Human-supplied
+  industry          String?
+  positioning       String?
+  pricingNotes      String?
+  existingCustomers String?
+  advantages        String[]
+
+  // AI-generated Business Intelligence Profile. Each block is a validated
+  // agent output, versioned so onboarding can be re-run without data loss.
+  whatWeSell       Json?
+  whoBuysToday     Json?
+  problemSolved    Json?
+  differentiators  Json?
+  b2cOpportunities Json?
+  b2bOpportunities Json?
+  seasonalNotes    Json?
+  partnershipIdeas Json?
+  openQuestions    Json? // gaps the analyst wants the user to fill
+
+  version    Int       @default(1)
+  analysedAt DateTime?
+  agentRunId String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@map("business_profiles")
+}
+
+model Offering {
+  id           String   @id @default(cuid())
+  businessId   String
+  name         String
+  description  String?
+  priceMin     Decimal? @db.Decimal(12, 2)
+  priceMax     Decimal? @db.Decimal(12, 2)
+  currency     String   @default("SGD")
+  unit         String? // "per hamper", "per head"
+  minOrderQty  Int?
+  leadTimeDays Int?
+  tags         String[]
+  isActive     Boolean  @default(true)
+
+  business   Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  valueProps ValueProposition[]
+
+  @@index([businessId])
+  @@map("offerings")
+}
+
+
+// ---------------------------------------------------------------------------
+// THE PAIR DATABASE - the actual asset
+//
+// A Pairing is a reusable thesis: companies in industry A have something that
+// companies in industry B need, there is a trigger that makes it urgent, and
+// there is a commission in the middle. SupplierLead is a real company being
+// recruited into the A side of one.
+// ---------------------------------------------------------------------------
+
+model Pairing {
+  id         String @id @default(cuid())
+  businessId String
+
+  supplierIndustry String // who we recruit (side A)
+  buyerIndustry    String // who they sell to (side B)
+  lane             PlayLane @default(DIRECT)
+
+  /** The core question this system exists to answer. */
+  whatAHas  String @db.Text
+  whatBNeeds String @db.Text
+  /** Why now - the event or season that makes B act. */
+  trigger      String  @db.Text
+  timingWindow String?
+
+  /** Roles to reach on each side. */
+  reachA String[]
+  reachB String[]
+
+  typicalDealLow  Decimal? @db.Decimal(12, 2)
+  typicalDealHigh Decimal? @db.Decimal(12, 2)
+  commissionRate  Decimal? @db.Decimal(6, 3)
+  currency        String   @default("SGD")
+
+  // 0..1 judgments; composite score computed in code.
+  demandStrength Float @default(0.5)
+  supplyEase     Float @default(0.5) // how easy is it to recruit side A
+  competition    Float @default(0.5)
+  confidence     Float @default(0.5)
+  score          Float @default(0)
+
+  evidence   Json?
+  status     String   @default("proposed") // proposed | active | parked
+  agentRunId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business      Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  leads         SupplierLead[]
+  introductions Introduction[]
+
+  @@index([businessId, status, score])
+  @@map("pairings")
+}
+
+model SupplierLead {
+  id         String  @id @default(cuid())
+  businessId String
+  companyId  String
+  pairingId  String?
+
+  status SupplierLeadStatus @default(IDENTIFIED)
+  source LeadSource         @default(SCRAPE)
+
+  /** What they sell, in their own words where possible. */
+  whatTheySell  String? @db.Text
+  /** The recruitment argument: which buyers we can bring them. */
+  whyTheyNeedUs String? @db.Text
+  targetBuyerIndustries String[]
+
+  /** How reachable they actually are - drives which channel to use. */
+  contactScore Int     @default(0)
+  contactTier  String  @default("THIN") // CONTACTABLE | PARTIAL | THIN
+  bestEmail    String?
+  bestPhone    String?
+  hasNamedContact Boolean @default(false)
+
+  scrapedAt  DateTime?
+  scrapeNotes Json?
+  agentRunId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  pairing  Pairing?  @relation(fields: [pairingId], references: [id])
+  messages Message[]
+
+  @@unique([businessId, companyId])
+  @@index([businessId, status, contactScore])
+  @@map("supplier_leads")
+}
+
+model ScrapeRun {
+  id         String @id @default(cuid())
+  businessId String
+  pairingId  String?
+
+  mode   String // "search" | "domains" | "csv"
+  query  String? @db.Text
+  status String  @default("running") // running | done | failed
+
+  targetsAttempted Int @default(0)
+  companiesCreated Int @default(0)
+  contactsFound    Int @default(0)
+  emailsFound      Int @default(0)
+  phonesFound      Int @default(0)
+  blockedByRobots  Int @default(0)
+  jsRenderedSites  Int @default(0)
+
+  log        Json?
+  error      String?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, startedAt])
+  @@map("scrape_runs")
+}
+
+// ---------------------------------------------------------------------------
+// SUPPLY SIDE - what we can put in front of a buyer
+//
+// The tenant's own catalogue is just a Supplier with isSelf = true. Everything
+// else is a third party we broker for. One code path serves both, so "sell my
+// own product" and "introduce two businesses and take a cut" are the same
+// machinery with different commission terms.
+// ---------------------------------------------------------------------------
+
+model Supplier {
+  id         String  @id @default(cuid())
+  businessId String
+  name       String
+  isSelf     Boolean @default(false) // true = the tenant's own products
+  companyId  String? // link to the canonical Company record when it is a real third party
+  websiteUrl String?
+  contactName String?
+  contactEmail String?
+  notes      String? @db.Text
+
+  defaultCommissionModel CommissionModel @default(PERCENT)
+  defaultCommissionRate  Decimal?        @db.Decimal(6, 3) // 12.5 = 12.5%
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  company  Company?          @relation(fields: [companyId], references: [id])
+  products SupplierProduct[]
+
+  @@index([businessId, isActive])
+  @@map("suppliers")
+}
+
+model SupplierProduct {
+  id         String @id @default(cuid())
+  supplierId String
+
+  name        String
+  description String?  @db.Text
+  priceMin    Decimal? @db.Decimal(12, 2)
+  priceMax    Decimal? @db.Decimal(12, 2)
+  currency    String   @default("SGD")
+  unit        String?
+  minOrderQty Int?
+  leadTimeDays Int?
+
+  kind     OfferingKind @default(PRODUCT)
+  rateType RateType     @default(FIXED_PRICE)
+
+  // Services only. An engagement is scoped, not stocked.
+  skills                String[]
+  typicalEngagementDays Int?
+  /**
+   * Observable symptoms that indicate this service is needed - job ads for
+   * repetitive roles, legacy stack mentions, manual-process complaints. For a
+   * service these ARE the discovery mechanism: you cannot match on "industry
+   * fit" the way you can for a product, you match on visible pain.
+   */
+  painSignals String[]
+
+  tags     String[]
+  /** Industry tags this offering suits - the matchmaker's first filter. */
+  idealFor String[]
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  matches  Match[]
+
+  @@index([supplierId, isActive])
+  @@map("supplier_products")
+}
+
+// ---------------------------------------------------------------------------
+// MATCH - the brokered pairing. Buyer (Prospect) x product (SupplierProduct).
+// This is the unit that earns money, so it carries the commission terms.
+// ---------------------------------------------------------------------------
+
+model Match {
+  id                String @id @default(cuid())
+  businessId        String
+  prospectId        String
+  supplierProductId String
+
+  fitScore  Float // 0..1, computed in code from agent-supplied features
+  rationale String @db.Text
+  /** The pitch angle, e.g. "seasonal_gifting" - correlates with reply rates. */
+  angle     String
+
+  // Services only. The symptom actually observed from outside, and the first
+  // ask. Kept as their own fields because the outreach writer needs the pain
+  // verbatim - deriving it from the rationale produces nonsense.
+  observedPain String? @db.Text
+  firstAsk     String?
+
+  status MatchStatus @default(PROPOSED)
+
+  estimatedDealValue  Decimal?        @db.Decimal(14, 2)
+  commissionModel     CommissionModel @default(PERCENT)
+  commissionRate      Decimal?        @db.Decimal(6, 3)
+  estimatedCommission Decimal?        @db.Decimal(14, 2)
+  currency            String          @default("SGD")
+
+  introducedAt DateTime?
+  closedAt     DateTime?
+  lostReason   String?
+
+  agentRunId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business  Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospect  Prospect           @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  product   SupplierProduct    @relation(fields: [supplierProductId], references: [id], onDelete: Cascade)
+  messages  Message[]
+  calls     DiscoveryCall[]
+  proposals SolutionProposal[]
+
+  @@unique([prospectId, supplierProductId])
+  @@index([businessId, status, fitScore])
+  @@map("matches")
+}
+
+
+// ---------------------------------------------------------------------------
+// SERVICES: discovery call -> scoped solution
+//
+// For a service the sale is not "here is the price". It is: get a call, find
+// out what actually hurts, scope something that fixes it, then quote. These two
+// models are that sequence made durable, and they are what a developer
+// introduction is actually worth - nobody hires a developer off a cold email,
+// they hire one after a conversation that named their problem correctly.
+// ---------------------------------------------------------------------------
+
+model DiscoveryCall {
+  id         String  @id @default(cuid())
+  businessId String
+  prospectId String
+  matchId    String?
+
+  heldAt    DateTime
+  attendees String[]
+  notes     String   @db.Text
+
+  /** [{ problem, impact, currentWorkaround, severity, hoursLostPerWeek? }] */
+  problemsIdentified Json
+  /** Systems and tools they named - the raw material for a scope. */
+  systemsMentioned   String[]
+
+  budgetSignal    String?
+  timelineSignal  String?
+  decisionProcess String?
+  nextStep        String?
+
+  agentRunId String?
+  createdAt  DateTime @default(now())
+
+  business  Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospect  Prospect           @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  match     Match?             @relation(fields: [matchId], references: [id])
+  proposals SolutionProposal[]
+
+  @@index([businessId, heldAt])
+  @@index([prospectId])
+  @@map("discovery_calls")
+}
+
+model SolutionProposal {
+  id              String  @id @default(cuid())
+  businessId      String
+  prospectId      String
+  matchId         String?
+  discoveryCallId String?
+
+  title   String
+  summary String @db.Text
+
+  /** [{ problem, solution, evidenceFromCall }] - each phase must trace to a stated problem. */
+  problemsAddressed Json
+  /** [{ name, description, days, deliverable }] */
+  phases            Json
+  risks             Json
+
+  estimatedDays       Int?
+  estimatedValue      Decimal? @db.Decimal(14, 2)
+  estimatedCommission Decimal? @db.Decimal(14, 2)
+  currency            String   @default("SGD")
+
+  status     String   @default("draft") // draft | sent | accepted | rejected
+  agentRunId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospect Prospect       @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  match    Match?         @relation(fields: [matchId], references: [id])
+  call     DiscoveryCall? @relation(fields: [discoveryCallId], references: [id])
+
+  @@index([businessId, status])
+  @@map("solution_proposals")
+}
+
+// ---------------------------------------------------------------------------
+// INDUSTRY SCOUT - which whole markets should we go after?
+// ---------------------------------------------------------------------------
+
+// Sits ABOVE the ICP. An ICP describes who inside a market to sell to; a play
+// argues that a whole market is worth entering, with a reason and a clock.
+// Accepting a play generates the ICP that operationalises it.
+model IndustryPlay {
+  id         String   @id @default(cuid())
+  businessId String
+  lane       PlayLane
+
+  industry    String // "Flower shops and florists"
+  subIndustry String?
+  motion      String // "B2B" | "B2C" | "B2B2C" | "PARTNERSHIP"
+
+  // The argument. thesis answers "why them", trigger answers "why now".
+  thesis        String  @db.Text
+  buyingTrigger String  @db.Text
+  timingWindow  String? // "6-8 weeks before 14 Feb"
+  reachVia      String[] // roles/departments that actually hold the budget
+
+  seasonalWindowId String?
+
+  // Ranking inputs, all 0..1. The composite `score` is computed in code.
+  demandStrength   Float
+  reachability     Float
+  competitionLevel Float // higher = more crowded
+  confidence       Float
+  score            Float
+
+  dealSizeLow  Decimal? @db.Decimal(12, 2)
+  dealSizeHigh Decimal? @db.Decimal(12, 2)
+  currency     String   @default("SGD")
+
+  evidence Json
+
+  // proposed -> accepted (becomes an ICP) | rejected | parked
+  status     String   @default("proposed")
+  icpId      String?
+  agentRunId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business  Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  season    SeasonalWindow? @relation(fields: [seasonalWindowId], references: [id])
+  prospects Prospect[]
+
+  @@index([businessId, status, score])
+  @@index([businessId, lane])
+  @@map("industry_plays")
+}
+
+// ---------------------------------------------------------------------------
+// ICP (spec section 2)
+// ---------------------------------------------------------------------------
+
+model Icp {
+  id         String @id @default(cuid())
+  businessId String
+  name       String // "Corporate gifting - financial services"
+  motion     String // "B2B" | "B2C"
+  rationale  String @db.Text
+
+  // Ranking inputs, all 0-1, each with an explanation stored in `evidence`.
+  purchaseLikelihood Float
+  orderValueScore    Float
+  frequencyScore     Float
+  timingScore        Float
+  accessibilityScore Float
+  compositeRank      Float
+  evidence           Json
+
+  // Machine-usable targeting filter consumed by the Prospect Hunter.
+  filter Json // { industries[], sizeMin, sizeMax, regions[], keywords[], excludes[] }
+
+  isActive   Boolean  @default(true)
+  version    Int      @default(1)
+  agentRunId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business  Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospects Prospect[]
+
+  @@index([businessId, isActive])
+  @@map("icps")
+}
+
+// ---------------------------------------------------------------------------
+// CANONICAL GRAPH - shared across tenants, deduped, provenance-tracked
+// ---------------------------------------------------------------------------
+
+model Company {
+  id String @id @default(cuid())
+
+  // Dedupe key: registrable domain (eTLD+1, lowercased, no www).
+  primaryDomain String? @unique
+  name          String
+  legalName     String?
+  regionId      String?
+  websiteUrl    String?
+  linkedinUrl   String?
+
+  industry      String?
+  subIndustry   String?
+  naicsCode     String?
+  description   String? @db.Text
+  employeeCount Int?
+  employeeBand  String? // "1-10", "11-50", ... - when exact is unknown
+  revenueBand   String?
+  foundedYear   Int?
+
+  addressLine String?
+  city        String?
+  postalCode  String?
+  countryCode String?
+
+  verification     VerificationStatus @default(UNVERIFIED)
+  lastResearchedAt DateTime?
+  researchVersion  Int                @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  region      Region?             @relation(fields: [regionId], references: [id])
+  identifiers CompanyIdentifier[]
+  locations   CompanyLocation[]
+  contacts    Contact[]
+  signals     BuyingSignal[]
+  prospects   Prospect[]
+  claims      Claim[]
+  siteAudit      SiteAudit?
+  qualifications Qualification[]
+  introsAsA      Introduction[] @relation("IntroA")
+  introsAsB      Introduction[] @relation("IntroB")
+  needs          Need[]
+  matchmakeAsA   Matchmake[]    @relation("MatchmakeA")
+  matchmakeAsB   Matchmake[]    @relation("MatchmakeB")
+  suppliers   Supplier[]
+  supplierLeads SupplierLead[]
+
+  @@index([regionId, industry])
+  @@index([name])
+  @@map("companies")
+}
+
+// Registry IDs are scheme-tagged so SG UEN, AU ABN, UK CRN all coexist.
+model CompanyIdentifier {
+  id        String           @id @default(cuid())
+  companyId String
+  scheme    IdentifierScheme
+  value     String
+  sourceUrl String?
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([scheme, value])
+  @@index([companyId])
+  @@map("company_identifiers")
+}
+
+model CompanyLocation {
+  id          String    @id @default(cuid())
+  companyId   String
+  label       String? // "HQ", "Outlet - Orchard"
+  addressLine String?
+  city        String?
+  countryCode String?
+  openedAt    DateTime? // a new location IS a buying signal
+  sourceUrl   String?
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@map("company_locations")
+}
+
+model Contact {
+  id        String @id @default(cuid())
+  companyId String
+
+  fullName   String
+  jobTitle   String?
+  seniority  String? // "C_LEVEL" | "VP" | "DIRECTOR" | "MANAGER" | "IC"
+  department String? // "HR", "PROCUREMENT", "MARKETING", "OPS"
+
+  // Business contact information only. `isBusinessContactInfo` records that the
+  // datum was published in a business capacity - the basis for the PDPA
+  // business-contact-information exclusion. See docs/04-compliance.md.
+  email       String?
+  phone       String?
+  linkedinUrl String?
+
+  isBusinessContactInfo Boolean            @default(true)
+  sourceUrl             String?
+  sourceType            String? // "company_website" | "public_registry" | "user_upload" | "reply"
+  verification          VerificationStatus @default(UNVERIFIED)
+  emailValidatedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company          Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  prospectContacts ProspectContact[]
+  messages         Message[]
+  threads          Thread[]
+  claims           Claim[]
+
+  @@unique([companyId, email])
+  @@index([companyId])
+  @@index([email])
+  @@map("contacts")
+}
+
+// Every externally-asserted fact lands here first. This is the anti-hallucination
+// spine: a Company field is only promoted from a Claim that carries a source.
+model Claim {
+  id        String  @id @default(cuid())
+  companyId String?
+  contactId String?
+
+  field        String // "employeeCount", "contact.email"
+  value        Json
+  confidence   Float
+  verification VerificationStatus @default(UNVERIFIED)
+
+  sourceUrl      String?
+  sourceTitle    String?
+  sourceQuote    String?   @db.Text
+  observedAt     DateTime
+  expiresAt      DateTime?
+  agentRunId     String?
+  supersededById String?
+
+  createdAt DateTime @default(now())
+
+  company Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contact Contact? @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, field])
+  @@index([contactId, field])
+  @@map("claims")
+}
+
+// ---------------------------------------------------------------------------
+// OPPORTUNITY / BUYING-TRIGGER ENGINE (spec section 5)
+// ---------------------------------------------------------------------------
+
+// Region-scoped calendar. Christmas/CNY/Hari Raya/Deepavali are seeded rows.
+model SeasonalWindow {
+  id       String   @id @default(cuid())
+  regionId String
+  name     String // "Chinese New Year"
+  startsOn DateTime @db.Date
+  endsOn   DateTime @db.Date
+
+  // Buying decisions happen before the event - this is when to reach out.
+  buyingLeadDays Int      @default(45)
+  relevantTo     String[] // industry tags this window matters for
+  notes          String?
+
+  region  Region         @relation(fields: [regionId], references: [id], onDelete: Cascade)
+  signals BuyingSignal[]
+  plays   IndustryPlay[]
+
+  @@unique([regionId, name, startsOn])
+  @@index([regionId, startsOn])
+  @@map("seasonal_windows")
+}
+
+model BuyingSignal {
+  id        String     @id @default(cuid())
+  companyId String
+  type      SignalType
+  title     String
+  summary   String?    @db.Text
+
+  observedAt DateTime
+  occursAt   DateTime? // when the triggering event happens/happened
+
+  // Signals rot. A funding round is hot for ~90 days, then it is background.
+  expiresAt DateTime?
+  strength  Float     @default(0.5) // 0-1, feeds the scorer
+
+  sourceUrl    String?
+  sourceTitle  String?
+  verification VerificationStatus @default(UNVERIFIED)
+  agentRunId   String?
+
+  seasonalWindowId String?
+  createdAt        DateTime @default(now())
+
+  company        Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  seasonalWindow SeasonalWindow? @relation(fields: [seasonalWindowId], references: [id])
+
+  @@index([companyId, expiresAt])
+  @@index([type, observedAt])
+  @@map("buying_signals")
+}
+
+// ---------------------------------------------------------------------------
+// PROSPECT - the tenant-scoped pursuit of a Company
+// ---------------------------------------------------------------------------
+
+model Prospect {
+  id         String  @id @default(cuid())
+  businessId String
+  companyId  String
+  icpId      String?
+
+  playId       String?
+
+  stage        ProspectStage @default(DISCOVERED)
+  tier         LeadTier?
+  score        Int?
+  scoreVersion Int?
+
+  source             String? // "hunter" | "manual" | "csv" | "referral"
+  disqualifiedReason String?
+  ownerUserId        String?
+
+  firstContactedAt DateTime?
+  lastActivityAt   DateTime?
+  nextActionAt     DateTime?
+  nextActionNote   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business   Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  company    Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  icp        Icp?                @relation(fields: [icpId], references: [id])
+  play       IndustryPlay?       @relation(fields: [playId], references: [id])
+  matches    Match[]
+  calls      DiscoveryCall[]
+  proposals  SolutionProposal[]
+  contacts   ProspectContact[]
+  scores     ScoreSnapshot[]
+  valueProps ValueProposition[]
+  recipients CampaignRecipient[]
+  activities Activity[]
+  tasks      Task[]
+  meetings   Meeting[]
+  deals      Deal[]
+  threads    Thread[]
+
+  @@unique([businessId, companyId])
+  @@index([businessId, stage])
+  @@index([businessId, tier, score])
+  @@index([businessId, nextActionAt])
+  @@map("prospects")
+}
+
+model ProspectContact {
+  id         String  @id @default(cuid())
+  prospectId String
+  contactId  String
+  isPrimary  Boolean @default(false)
+  roleGuess  String? // "decision maker" | "influencer" | "gatekeeper"
+  rationale  String?
+
+  prospect Prospect @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  contact  Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([prospectId, contactId])
+  @@map("prospect_contacts")
+}
+
+// ---------------------------------------------------------------------------
+// SCORING (spec section 7) - deterministic, versioned, explainable
+// ---------------------------------------------------------------------------
+
+// Weights live in data so the Performance Agent can refit them from outcomes
+// without a code deploy, and so old scores stay reproducible.
+model ScoringModel {
+  id         String   @id @default(cuid())
+  businessId String? // null = platform default
+  version    Int
+  weights    Json // { industryFit: 0.18, signalRecency: 0.22, ... }
+  fittedFrom Json? // outcome counts the fit was derived from
+  isActive   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  business  Business?       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  snapshots ScoreSnapshot[]
+
+  @@unique([businessId, version])
+  @@map("scoring_models")
+}
+
+model ScoreSnapshot {
+  id         String @id @default(cuid())
+  prospectId String
+  modelId    String
+
+  score Int
+  tier  LeadTier
+
+  // Full breakdown: [{ factor, rawValue, weight, contribution, evidence, sourceUrl }]
+  // This is what renders "92/100 - HOT because ..." and what makes it auditable.
+  factors     Json
+  explanation String @db.Text
+
+  agentRunId String?
+  createdAt  DateTime @default(now())
+
+  prospect Prospect     @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  model    ScoringModel @relation(fields: [modelId], references: [id])
+
+  @@index([prospectId, createdAt])
+  @@map("score_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// VALUE PROPOSITION (spec section 6)
+// ---------------------------------------------------------------------------
+
+model ValueProposition {
+  id         String  @id @default(cuid())
+  businessId String
+  prospectId String?
+  offeringId String?
+
+  headline String
+  body     String @db.Text
+
+  // The inputs that produced it - lets the UI show "why we said this"
+  // and lets the Performance Agent correlate angles with replies.
+  angle       String // "seasonal_gifting" | "expansion" | "client_appreciation"
+  signalIds   String[]
+  proofPoints Json?
+
+  agentRunId String?
+  createdAt  DateTime @default(now())
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospect Prospect? @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  offering Offering? @relation(fields: [offeringId], references: [id])
+
+  @@index([businessId, angle])
+  @@map("value_propositions")
+}
+
+// ---------------------------------------------------------------------------
+// CAMPAIGNS + MESSAGING (spec sections 8, 9)
+// ---------------------------------------------------------------------------
+
+model Campaign {
+  id         String @id @default(cuid())
+  businessId String
+
+  name      String
+  objective String  @db.Text
+  channel   Channel @default(EMAIL)
+  status    String  @default("draft") // draft | approved | running | paused | done
+
+  // "same or similar subject matter" grouping key for the bulk-threshold test.
+  contentGroupId String
+
+  audienceFilter Json?
+  offer          String?
+  startsAt       DateTime?
+  endsAt         DateTime?
+  timezone       String?
+
+  agentRunId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business   Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  steps      CampaignStep[]
+  recipients CampaignRecipient[]
+  messages   Message[]
+
+  @@index([businessId, status])
+  @@map("campaigns")
+}
+
+model CampaignStep {
+  id         String @id @default(cuid())
+  campaignId String
+
+  stepOrder    Int
+  delayDays    Int      @default(0)
+  channel      Channel  @default(EMAIL)
+  subjectLines String[] // variants for A/B
+  bodyTemplate String   @db.Text
+  cta          String?
+  stopOnReply  Boolean  @default(true)
+
+  campaign Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@unique([campaignId, stepOrder])
+  @@map("campaign_steps")
+}
+
+model CampaignRecipient {
+  id         String @id @default(cuid())
+  campaignId String
+  prospectId String
+
+  status         String    @default("pending") // pending | active | replied | stopped | excluded
+  excludedReason String?
+  currentStep    Int       @default(0)
+  nextSendAt     DateTime?
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  prospect Prospect @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, prospectId])
+  @@index([campaignId, nextSendAt])
+  @@map("campaign_recipients")
+}
+
+model Mailbox {
+  id         String @id @default(cuid())
+  businessId String
+
+  provider    String // "gmail" | "microsoft" | "resend" | "postmark" | "mock"
+  address     String
+  displayName String?
+
+  // OAuth material is stored encrypted at rest; see docs/01-architecture.md.
+  credentialRef String?
+  historyCursor String? // Gmail historyId / Graph deltaLink for incremental sync
+  isActive      Boolean   @default(true)
+  dailySendCap  Int       @default(50)
+  lastSyncedAt  DateTime?
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  messages Message[]
+  threads  Thread[]
+
+  @@unique([businessId, address])
+  @@map("mailboxes")
+}
+
+model Thread {
+  id         String  @id @default(cuid())
+  businessId String
+  prospectId String?
+  contactId  String?
+  mailboxId  String?
+
+  providerThreadId String?
+  subject          String?
+  lastMessageAt    DateTime?
+  isClosed         Boolean   @default(false)
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospect Prospect? @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  contact  Contact?  @relation(fields: [contactId], references: [id])
+  mailbox  Mailbox?  @relation(fields: [mailboxId], references: [id])
+  messages Message[]
+
+  @@unique([mailboxId, providerThreadId])
+  @@index([businessId, lastMessageAt])
+  @@map("threads")
+}
+
+model Message {
+  id             String  @id @default(cuid())
+  businessId     String
+  matchId        String?
+  supplierLeadId String?
+  /// The introduction this message was written from. One message can cover
+  /// several introductions to the same company — this names the one used as the
+  /// hook, and `Introduction.outreachMessageId` points back from all of them.
+  introductionId String?
+  threadId   String?
+  campaignId String?
+  stepId     String?
+  contactId  String?
+  mailboxId  String?
+
+  channel   Channel
+  direction Direction
+  status    MessageStatus @default(DRAFT)
+
+  subject  String?
+  bodyText String? @db.Text
+  bodyHtml String? @db.Text
+
+  // Populated by the send gate - see docs/04-compliance.md
+  advPrefixApplied Boolean @default(false)
+  unsubscribeUrl   String?
+  gateDecision     Json?
+  blockedReason    String?
+
+  providerMessageId String?
+  /// The provider's conversation id (Gmail threadId). Reply attribution needs
+  /// this: without it a reply can only be matched to a contact, not to the
+  /// specific email it answers.
+  providerThreadId  String?
+  scheduledAt       DateTime?
+  sentAt            DateTime?
+  deliveredAt       DateTime?
+  openedAt          DateTime?
+  repliedAt         DateTime?
+  bouncedAt         DateTime?
+
+  // Inbound only
+  replyClass      ReplyClass?
+  classifierRunId String?
+  classifierNotes String?     @db.Text
+
+  agentRunId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business  Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  match        Match?        @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  supplierLead SupplierLead? @relation(fields: [supplierLeadId], references: [id], onDelete: Cascade)
+  introduction Introduction? @relation(fields: [introductionId], references: [id], onDelete: SetNull)
+  thread    Thread?        @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  campaign  Campaign?      @relation(fields: [campaignId], references: [id])
+  step      CampaignStep?  @relation(fields: [stepId], references: [id])
+  contact   Contact?       @relation(fields: [contactId], references: [id])
+  mailbox   Mailbox?       @relation(fields: [mailboxId], references: [id])
+  events    MessageEvent[]
+  approvals Approval[]
+
+  @@index([businessId, status, scheduledAt])
+  @@index([businessId, direction, createdAt])
+  @@index([campaignId])
+  @@map("messages")
+}
+
+model MessageEvent {
+  id         String   @id @default(cuid())
+  messageId  String
+  type       String // delivered | open | click | bounce | complaint | unsubscribe
+  occurredAt DateTime
+  metadata   Json?
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId, type])
+  @@map("message_events")
+}
+
+// ---------------------------------------------------------------------------
+// COMPLIANCE (spec section 22) - enforced in the send path, not advisory
+// ---------------------------------------------------------------------------
+
+model SendPolicy {
+  id         String @id @default(cuid())
+  businessId String @unique
+
+  // Spam Control Act 2007 bulk thresholds. Configurable because they are
+  // jurisdictional, and because the Minister may vary them by Gazette order.
+  bulkPer24h  Int @default(100)
+  bulkPer30d  Int @default(1000)
+  bulkPer365d Int @default(10000)
+
+  // When a send would cross a threshold: "block" (hold for review, stay
+  // out of bulk territory) or "comply" (auto-apply <ADV> + unsubscribe).
+  onThresholdCross String @default("block")
+
+  senderName         String?
+  senderPostalAddr   String?
+  senderContactEmail String?
+  senderContactPhone String?
+
+  alwaysIncludeUnsubscribe Boolean @default(true)
+  dailySendCap             Int     @default(100)
+  minMinutesBetweenSends   Int     @default(2)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@map("send_policies")
+}
+
+// Append-only. The bulk-threshold evaluator counts rows in this table.
+model SendLedgerEntry {
+  id         String  @id @default(cuid())
+  businessId String
+  messageId  String?
+  channel    Channel
+
+  // Hash of the normalised subject + template - the "same or similar
+  // subject matter" bucket the statute counts within.
+  contentGroupId String
+  recipientHash  String // salted hash; ledger holds no raw addresses
+  sentAt         DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, contentGroupId, sentAt])
+  @@map("send_ledger_entries")
+}
+
+model SuppressionEntry {
+  id         String  @id @default(cuid())
+  businessId String? // null when scope = GLOBAL
+
+  scope  SuppressionScope
+  reason SuppressionReason
+
+  // Exactly one identifier is set; all are stored hashed as well as raw so
+  // suppression survives contact deletion (right-to-erasure safe).
+  email     String?
+  emailHash String?
+  phone     String?
+  phoneHash String?
+  domain    String?
+
+  note            String?
+  sourceMessageId String?
+  createdAt       DateTime  @default(now())
+  expiresAt       DateTime?
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, emailHash])
+  @@index([emailHash])
+  @@index([domain])
+  @@map("suppression_entries")
+}
+
+// Jurisdiction rules as data, so adding Australia is a seed, not a refactor.
+model ComplianceRule {
+  id       String  @id @default(cuid())
+  regionId String
+  channel  Channel
+  key      String // "requires_adv_prefix_when_bulk", "dnc_check_required"
+  value    Json
+  citation String? // statute reference for the audit trail
+
+  region Region @relation(fields: [regionId], references: [id], onDelete: Cascade)
+
+  @@unique([regionId, channel, key])
+  @@map("compliance_rules")
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  businessId String?
+  actorType  String // "user" | "agent" | "system"
+  actorId    String?
+  action     String // "message.sent", "contact.deleted", "gate.blocked"
+  entityType String?
+  entityId   String?
+  before     Json?
+  after      Json?
+  createdAt  DateTime @default(now())
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// CRM (spec section 11)
+// ---------------------------------------------------------------------------
+
+model Activity {
+  id         String   @id @default(cuid())
+  prospectId String
+  type       String // discovered | researched | scored | email_sent | replied | ...
+  summary    String
+  occurredAt DateTime @default(now())
+  actorType  String   @default("agent")
+  actorId    String?
+  metadata   Json?
+
+  prospect Prospect @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+
+  @@index([prospectId, occurredAt])
+  @@map("activities")
+}
+
+model Task {
+  id         String     @id @default(cuid())
+  businessId String
+  prospectId String?
+  title      String
+  detail     String?    @db.Text
+  dueAt      DateTime?
+  status     TaskStatus @default(OPEN)
+  createdBy  String     @default("agent")
+  createdAt  DateTime   @default(now())
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospect Prospect? @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, status, dueAt])
+  @@map("tasks")
+}
+
+model Meeting {
+  id         String    @id @default(cuid())
+  businessId String
+  prospectId String?
+  title      String
+  startsAt   DateTime
+  endsAt     DateTime?
+  location   String?
+  attendees  Json?
+  outcome    String?   @db.Text
+  externalId String?
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospect Prospect? @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, startsAt])
+  @@map("meetings")
+}
+
+model Deal {
+  id              String    @id @default(cuid())
+  businessId      String
+  prospectId      String
+  name            String
+  stage           DealStage @default(OPEN)
+  amount          Decimal?  @db.Decimal(14, 2)
+  currency        String    @default("SGD")
+  expectedCloseAt DateTime?
+  closedAt        DateTime?
+  lostReason      String?
+
+  // Attribution for closed-loop learning (spec section 16)
+  sourceCampaignId String?
+  sourceSignalId   String?
+  sourceIcpId      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  prospect Prospect        @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  revenue  RevenueRecord[]
+
+  @@index([businessId, stage])
+  @@map("deals")
+}
+
+model RevenueRecord {
+  id           String   @id @default(cuid())
+  dealId       String
+  amount       Decimal  @db.Decimal(14, 2)
+  currency     String   @default("SGD")
+  recognisedAt DateTime
+  note         String?
+
+  deal Deal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+
+  @@index([dealId])
+  @@map("revenue_records")
+}
+
+// ---------------------------------------------------------------------------
+// AI OPERATIONS (spec sections 13, 17, 18)
+// ---------------------------------------------------------------------------
+
+// One row per LLM invocation. Cost control, debugging, and the audit trail
+// required by spec section 19 ("every important AI action should be recorded").
+model AgentRun {
+  id         String    @id @default(cuid())
+  businessId String?
+  agent      AgentName
+  status     RunStatus @default(RUNNING)
+
+  model           String
+  effort          String?
+  inputHash       String // dedupe + cache-hit analysis
+  input           Json
+  output          Json?
+  errorCode       String?
+  errorDetail     String?
+  refusalCategory String?
+
+  inputTokens      Int?
+  outputTokens     Int?
+  cacheReadTokens  Int?
+  cacheWriteTokens Int?
+  costUsd          Decimal? @db.Decimal(10, 6)
+  latencyMs        Int?
+
+  parentRunId String?
+  jobId       String?
+  startedAt   DateTime  @default(now())
+  finishedAt  DateTime?
+
+  business Business?  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  parent   AgentRun?  @relation("RunTree", fields: [parentRunId], references: [id])
+  children AgentRun[] @relation("RunTree")
+
+  @@index([businessId, agent, startedAt])
+  @@index([inputHash])
+  @@map("agent_runs")
+}
+
+model Recommendation {
+  id         String @id @default(cuid())
+  businessId String
+
+  kind      String // "campaign" | "segment" | "reactivation" | "channel" | "market"
+  title     String
+  body      String @db.Text
+  rationale String @db.Text
+
+  // Ranked so the dashboard shows the highest-value action first.
+  priority       Int      @default(0)
+  estimatedValue Decimal? @db.Decimal(14, 2)
+
+  // Deep link payload: { action: "create_campaign", icpId, prospectIds[] }
+  actionPayload Json?
+
+  status     RecommendationStatus @default(NEW)
+  expiresAt  DateTime?
+  agentRunId String?
+  createdAt  DateTime             @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, status, priority])
+  @@map("recommendations")
+}
+
+model Approval {
+  id         String  @id @default(cuid())
+  businessId String
+  messageId  String?
+
+  entityType String // "message" | "campaign" | "prospect_batch" | "strategy"
+  entityId   String
+  status     ApprovalStatus @default(PENDING)
+
+  proposed Json
+  edited   Json?
+  note     String?
+
+  requestedAt DateTime  @default(now())
+  decidedAt   DateTime?
+  decidedById String?
+
+  business  Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  message   Message? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  decidedBy User?    @relation(fields: [decidedById], references: [id])
+
+  @@index([businessId, status, requestedAt])
+  @@map("approvals")
+}
+
+// Rolled-up conversion facts the Performance Agent reads and the Scoring
+// model refits from. Recomputed nightly; never written by an LLM directly.
+model OutcomeStat {
+  id         String @id @default(cuid())
+  businessId String
+
+  dimension   String // "industry" | "employee_band" | "job_title" | "signal_type" | "angle"
+  value       String
+  windowStart DateTime
+  windowEnd   DateTime
+
+  prospects Int     @default(0)
+  contacted Int     @default(0)
+  replied   Int     @default(0)
+  positive  Int     @default(0)
+  meetings  Int     @default(0)
+  won       Int     @default(0)
+  revenue   Decimal @default(0) @db.Decimal(14, 2)
+
+  computedAt DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, dimension, value, windowStart, windowEnd])
+  @@index([businessId, dimension])
+  @@map("outcome_stats")
+}
+
+
+/// A cached set of search queries for one industry in one region.
+///
+/// Generating variants costs a model call and running them costs search
+/// credits. Neither should be paid twice for the same industry, so the plan is
+/// stored and reused until something explicitly refreshes it. This is also the
+/// record of *why* a search found what it found — without it, a thin result set
+/// is indistinguishable from a badly phrased query.
+model QueryPlan {
+  id       String @id @default(cuid())
+  /// Normalised "industry|region", so "Aircon Servicing" and "aircon servicing"
+  /// share one plan rather than paying twice for the same answer.
+  key      String @unique
+  industry String
+  region   String
+
+  /// Array of { query, intent, why }.
+  queries   Json
+  /// Terms whose presence in a result title means the wrong kind of page.
+  negatives Json?
+  rationale String?
+
+  /// "agent" when the model produced it, "heuristic" when the fallback did.
+  /// A database full of heuristic plans means the model path is broken.
+  source     String  @default("agent")
+  agentRunId String?
+
+  /// How many searches have used this plan, and what they yielded. Cheap
+  /// feedback on which phrasings are actually worth their credits.
+  timesUsed      Int @default(0)
+  companiesFound Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([industry, region])
+}
+
+
+// ---------------------------------------------------------------------------
+// QUALIFICATION (the gate between "a company exists" and "worth contacting")
+// ---------------------------------------------------------------------------
+
+enum QualificationStatus {
+  QUALIFIED // worth spending outreach on
+  REVIEW    // borderline; a human decides
+  REJECTED  // kept, with a reason — never deleted
+}
+
+/// Why a company did not qualify. Stored rather than discarded: a rejection
+/// with a reason is data (it tunes the ICP and the query strategist), a deleted
+/// row is a company we will rediscover and re-crawl next month.
+enum RejectionReason {
+  NO_CONTACT_ROUTE
+  SITE_UNREACHABLE
+  BLOCKED_BY_ROBOTS
+  NOT_A_BUSINESS
+  AGGREGATOR
+  WRONG_INDUSTRY
+  NO_PAIRING_THESIS
+  OUT_OF_REGION
+  DUPLICATE
+  SUPPRESSED
+  MANUAL
+}
+
+/// What a company's website measurably is.
+///
+/// Every field here is observed, not judged: a boolean the parser can prove or
+/// a number it can count. That matters twice over — it costs no tokens, and it
+/// is defensible in an outreach email. "Your quote page has no form" is
+/// checkable by the person reading it; "your site looks dated" is an opinion
+/// they can dismiss.
+model SiteAudit {
+  id        String @id @default(cuid())
+  companyId String @unique
+
+  reachable      Boolean @default(false)
+  httpsOk        Boolean @default(false)
+  mobileViewport Boolean @default(false)
+  hasContactForm Boolean @default(false)
+  hasEmailLink   Boolean @default(false)
+  hasPhoneLink   Boolean @default(false)
+  hasStructured  Boolean @default(false)
+  jsRendered     Boolean @default(false)
+
+  pageBytes    Int?
+  loadMs       Int?
+  titleLength  Int?
+  /// Most recent year in a copyright line. A 2019 footer is a real signal.
+  copyrightYear Int?
+  socialCount  Int @default(0)
+  pagesFetched Int @default(0)
+
+  /// 0-100, computed by arithmetic from the fields above. Never model-assigned.
+  score     Int      @default(0)
+  /// Human-readable findings, each one traceable to a field above.
+  findings  Json?
+  checkedAt DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@map("site_audits")
+}
+
+/// The verdict on one company for one business.
+///
+/// The score is arithmetic over weighted features (ADR-002: the model extracts
+/// features, it never assigns the number). `factors` carries the full breakdown
+/// so any score can be explained line by line rather than trusted.
+model Qualification {
+  id         String @id @default(cuid())
+  businessId String
+  companyId  String
+
+  status QualificationStatus
+  /// A-D, derived from score. A grade is what a person acts on; a score is what
+  /// the system sorts by.
+  grade  String
+  score  Int
+
+  rejectionReason RejectionReason?
+  /// [{ factor, rawValue, weight, contribution, evidence }]
+  factors         Json
+  explanation     String @db.Text
+
+  /// Which ScoringModel version produced this, so old verdicts stay reproducible.
+  modelVersion Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  company  Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, companyId])
+  @@index([businessId, status, score])
+  @@map("qualifications")
+}
+
+
+// ---------------------------------------------------------------------------
+// INTRODUCTIONS — the broker's actual unit of work
+// ---------------------------------------------------------------------------
+
+enum IntroductionStatus {
+  PROPOSED   // computed, nobody contacted
+  APPROVED   // a human said yes, worth making
+  A_CONTACTED
+  A_AGREED   // side A wants the buyers
+  B_CONTACTED
+  INTRODUCED // both sides connected
+  WON
+  LOST
+  DISCARDED
+}
+
+/// Two specific companies who should meet, and why.
+///
+/// Distinct from `Match` on purpose. Match links a Prospect to a
+/// SupplierProduct, which presumes side A has already been onboarded as a
+/// Supplier with agreed commission terms. At the point this record is created,
+/// neither company has agreed to anything — both were found by scraping. Reusing
+/// Match here would mean fabricating Supplier and SupplierProduct rows for
+/// companies that have never heard of us, which would make the supplier tables
+/// worthless as a record of who has actually signed.
+///
+/// An Introduction is a proposal. When side A agrees, they become a real
+/// Supplier and this can be promoted to a Match.
+model Introduction {
+  id         String @id @default(cuid())
+  businessId String
+  pairingId  String
+
+  /// Side A: has the capability. Side B: has the need.
+  companyAId String
+  companyBId String
+
+  /// 0..1, computed in code from features. Never model-assigned (ADR-002).
+  fitScore Float
+  /// [{ factor, rawValue, weight, contribution, evidence }]
+  factors  Json
+  /// Why these two, in a sentence a human can check.
+  rationale String @db.Text
+  /// The measured weakness or event that makes this worth raising now.
+  trigger   String? @db.Text
+
+  estimatedDealValue  Decimal? @db.Decimal(14, 2)
+  commissionRate      Decimal? @db.Decimal(6, 3)
+  estimatedCommission Decimal? @db.Decimal(14, 2)
+  currency            String   @default("SGD")
+
+  status IntroductionStatus @default(PROPOSED)
+  notes  String?            @db.Text
+
+  introducedAt DateTime?
+  closedAt     DateTime?
+  lostReason   String?
+
+  /// The side-A recruitment email covering this introduction.
+  outreachMessageId String?
+
+  messages Message[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  pairing  Pairing  @relation(fields: [pairingId], references: [id], onDelete: Cascade)
+  companyA Company  @relation("IntroA", fields: [companyAId], references: [id], onDelete: Cascade)
+  companyB Company  @relation("IntroB", fields: [companyBId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, companyAId, companyBId, pairingId])
+  @@index([businessId, status, fitScore])
+  @@map("introductions")
+}
+
+
+// ---------------------------------------------------------------------------
+// MATCHMAKING - AI-proposed pairs, judged on value to BOTH sides
+// ---------------------------------------------------------------------------
+
+enum MatchmakeStatus {
+  PROPOSED
+  SHORTLISTED
+  DISMISSED
+  ACTED_ON
+}
+
+/// A specific pair of companies the matchmaker thinks should meet.
+///
+/// Distinct from `Introduction`, which is arithmetic: an industry-level thesis
+/// applied mechanically to every company on each side. This is the opposite
+/// direction — the model looks at two actual companies and argues for THAT
+/// pair, including combinations no industry pairing would ever produce.
+///
+/// The defining constraint is mutual value. A one-sided match is just a sales
+/// lead wearing a nicer name, and the broker who keeps making them stops being
+/// worth replying to. So `valueToA` and `valueToB` are both required, and a
+/// proposal that cannot fill in one of them should not exist.
+model Matchmake {
+  id         String @id @default(cuid())
+  businessId String
+
+  companyAId String
+  companyBId String
+
+  /// What A gets. Concrete, not "more business".
+  valueToA String @db.Text
+  /// What B gets. Equally concrete.
+  valueToB String @db.Text
+  /// The sentence you would actually say when introducing them.
+  pitch    String @db.Text
+  /// Why this is worth raising now rather than any time.
+  whyNow   String? @db.Text
+
+  /// How unusual the pairing is. Obvious matches are easy and low-margin;
+  /// the non-obvious ones are where a broker earns the fee.
+  novelty    Float @default(0.5)
+  /// The model's own confidence, kept separate from novelty on purpose.
+  confidence Float @default(0.5)
+
+  /// Facts used, each traceable to something in the database.
+  groundedOn Json?
+  /// Anything the model assumed rather than knew. Read this before acting.
+  assumptions Json?
+
+  estimatedValue      Decimal? @db.Decimal(14, 2)
+  commissionRate      Decimal? @db.Decimal(6, 3)
+  estimatedCommission Decimal? @db.Decimal(14, 2)
+  currency            String   @default("SGD")
+
+  status     MatchmakeStatus @default(PROPOSED)
+  agentRunId String?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  companyA Company  @relation("MatchmakeA", fields: [companyAId], references: [id], onDelete: Cascade)
+  companyB Company  @relation("MatchmakeB", fields: [companyBId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, companyAId, companyBId])
+  @@index([businessId, status, novelty])
+  @@map("matchmakes")
+}
+
+
+// ---------------------------------------------------------------------------
+// DEMAND-FIRST MODEL (docs: demand-first remodel)
+// ---------------------------------------------------------------------------
+
+/// How solid a stated requirement is.
+///
+/// The ladder exists so that inference and evidence never get confused. Only
+/// CONFIRMED may be quoted to a supplier, because only CONFIRMED is traceable
+/// to something a human actually wrote back. Everything the model merely
+/// inferred stays SUSPECTED and is never repeated to a third party as fact.
+enum NeedStatus {
+  SUSPECTED // inferred from industry or a site observation. Not evidence.
+  PROBED    // we asked. No answer yet.
+  CONFIRMED // they told us, in their own words.
+  FILLED    // a supplier was introduced for it.
+  DEAD      // they said no, or the window closed.
+}
+
+enum NeedUrgency {
+  NOW
+  THIS_QUARTER
+  SOMEDAY
+  NOT_IN_MARKET
+}
+
+/// Something a real buyer has said they need.
+///
+/// This is the object the demand-first model turns on. Introductions exist to
+/// fill one; suppliers are recruited to serve one. Before this existed, the
+/// system generated 782 introductions on the assumption that buyers wanted
+/// things — an assumption nothing ever tested.
+model Need {
+  id         String @id @default(cuid())
+  businessId String
+  companyId  String
+
+  /// What they need, in our vocabulary — matches a Pairing supplierIndustry.
+  category String
+  /// Their own words. This is what gets quoted to a supplier, never a summary.
+  verbatim String? @db.Text
+
+  status  NeedStatus  @default(SUSPECTED)
+  urgency NeedUrgency @default(SOMEDAY)
+
+  /// Who they use today, if they told us. Knowing the incumbent is worth as
+  /// much as knowing the need.
+  incumbent  String?
+  /// Only if volunteered. Never inferred.
+  budgetHint String?
+
+  /// The inbound reply that established this. No message, no CONFIRMED.
+  sourceMessageId String?
+  /// The probe we sent, so reply rate per category is measurable.
+  probeMessageId  String?
+
+  confidence Float    @default(0.3)
+  notes      String?  @db.Text
+  probedAt   DateTime?
+  confirmedAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  company  Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, companyId, category])
+  @@index([businessId, status, urgency])
+  @@map("needs")
+}
+
+// ---------------------------------------------------------------------------
+// CHANGE LOG - what was changed, and what it was before
+// ---------------------------------------------------------------------------
+
+enum ChangeArea {
+  SCHEMA
+  AGENT
+  PIPELINE
+  UI
+  FIX
+  COMPLIANCE
+}
+
+/// A record of what changed in the system and why.
+///
+/// Written by the code that makes the change, not maintained by hand — a
+/// hand-kept list drifts from the code within a week and then quietly misleads.
+/// `before` and `after` are required because "improved the scoring" is not a
+/// change description; "rejected 14 aggregators, now rejects 33" is.
+model ChangeLog {
+  id         String     @id @default(cuid())
+  businessId String?
+  area       ChangeArea
+  title      String
+  before     String     @db.Text
+  after      String     @db.Text
+  why        String     @db.Text
+  /// What this unblocks or costs. Optional.
+  impact     String?    @db.Text
+  createdAt  DateTime   @default(now())
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@map("change_log")
+}

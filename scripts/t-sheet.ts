@@ -1,0 +1,14 @@
+import { db } from "@/lib/db";
+import { buildExportData } from "@/lib/export-data";
+const biz = await db.business.findFirstOrThrow({ orderBy: { createdAt: "asc" } });
+const d = await buildExportData(biz.id);
+console.log(`  Companies tab      ${d.companies.length} rows`);
+console.log(`  Introductions tab  ${d.introductions.length} rows`);
+console.log(`  Pairings tab       ${d.pairings.length} rows`);
+console.log(`\nnot in the Sheet at all:`);
+console.log(`  Needs              ${await db.need.count({ where: { businessId: biz.id } })}`);
+console.log(`  Matchmakes         ${await db.matchmake.count({ where: { businessId: biz.id } })}`);
+console.log(`  Qualifications     ${await db.qualification.count({ where: { businessId: biz.id } })}`);
+console.log(`\nsheet url: ${biz.sheetUrl}`);
+console.log(`auto-sync: ${biz.sheetAutoSync}  (last synced ${biz.sheetSyncedAt?.toLocaleString() ?? "never"})`);
+await db.$disconnect();

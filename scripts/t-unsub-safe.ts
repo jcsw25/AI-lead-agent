@@ -1,0 +1,10 @@
+import { db } from "@/lib/db";
+const before = await db.suppressionEntry.count();
+const res = await fetch("http://localhost:3000/u/7eea4ebb0d625ea3ed06f07a");
+const html = await res.text();
+const after = await db.suppressionEntry.count();
+console.log(`GET on the unsubscribe URL   ${res.status}`);
+console.log(`suppressions before / after  ${before} / ${after}`);
+console.log(`a scanner would suppress?    ${after > before ? "YES — STILL BROKEN" : "no"}`);
+console.log(`page asks for confirmation?  ${/Unsubscribe me/.test(html) ? "yes" : "NO"}`);
+await db.$disconnect();

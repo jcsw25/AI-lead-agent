@@ -1,0 +1,20 @@
+import { db } from "@/lib/db";
+const biz = await db.business.findFirstOrThrow({ orderBy: { createdAt: "asc" } });
+const intros = await db.introduction.count({ where: { businessId: biz.id, status: { in: ["PROPOSED","APPROVED","A_AGREED","B_CONTACTED"] } } });
+const sent = await db.message.count({ where: { businessId: biz.id, status: "SENT", direction: "OUTBOUND", contact: { company: { name: { not: { contains: "Self test" } } } } } });
+const suppliers = await db.supplier.count({ where: { businessId: biz.id, isActive: true } });
+const deals = await db.deal.count();
+const matches = await db.match.count({ where: { businessId: biz.id } });
+console.log(`introductions proposed      ${intros}`);
+console.log(`emails to real companies    ${sent}`);
+console.log(`suppliers who actually said yes  ${suppliers}  (both are records I created, not agreements)`);
+console.log(`deals                       ${deals}`);
+console.log(`matches                     ${matches}`);
+// How much of the confidence is assumption?
+const mm = await db.matchmake.findMany({ where: { businessId: biz.id }, select: { confidence: true, assumptions: true, groundedOn: true } });
+const avgConf = mm.reduce((s, m) => s + m.confidence, 0) / (mm.length || 1);
+const assumptions = mm.reduce((s, m) => s + ((m.assumptions as string[] | null) ?? []).length, 0);
+const grounded = mm.reduce((s, m) => s + ((m.groundedOn as string[] | null) ?? []).length, 0);
+console.log(`\nmatchmakes: avg confidence ${Math.round(avgConf*100)}% · ${grounded} grounded facts vs ${assumptions} assumptions`);
+console.log(`\nagent spend: $${(await db.agentRun.aggregate({ _sum: { costUsd: true } }))._sum.costUsd ?? 0}`);
+await db.$disconnect();
