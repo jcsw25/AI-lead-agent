@@ -162,6 +162,14 @@ export async function scheduleEnrichment(businessId: string, industry: string): 
       data: {
         status: "done",
         companiesCreated: crawled,
+        // These columns exist and were never written, so every run recorded
+        // "emails=0" while the database filled with 1,114 of them. The one
+        // place that would say which industries yield contactable companies was
+        // reporting nothing — and it was quoted in progress summaries as though
+        // it meant something.
+        emailsFound: emails,
+        phonesFound: phones,
+        blockedByRobots: skipped.filter((s) => /robots/i.test(String(s))).length,
         finishedAt: new Date(),
         log: { done, emails, phones, crawled, skipped: skipped.slice(0, 40) } as object,
       },

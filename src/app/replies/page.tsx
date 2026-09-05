@@ -53,6 +53,20 @@ export default async function RepliesPage({
       providerThreadId: true, contactId: true, classifierNotes: true,
     },
   });
+  // What each reply was read to mean. Keyed by the message it was taken from,
+  // which is the same link the extractor writes — a need with no source message
+  // cannot appear here, which is the point.
+  const needRows = await db.need.findMany({
+    where: { businessId: business.id, sourceMessageId: { in: inbound.map((i) => i.id) } },
+    select: { id: true, category: true, status: true, urgency: true, incumbent: true, budgetHint: true, sourceMessageId: true },
+  });
+  const extracted = new Map<string, typeof needRows>();
+  for (const n of needRows) {
+    const list = extracted.get(n.sourceMessageId!) ?? [];
+    list.push(n);
+    extracted.set(n.sourceMessageId!, list);
+  }
+
   const byThread = new Map(inbound.filter((i) => i.providerThreadId).map((i) => [i.providerThreadId!, i]));
   const byContact = new Map<string, typeof inbound[number]>();
   for (const i of inbound) if (i.contactId && !byContact.has(i.contactId)) byContact.set(i.contactId, i);
@@ -179,6 +193,24 @@ export default async function RepliesPage({
                       {(reply.bodyText ?? "").slice(0, 400)}
                       {(reply.bodyText ?? "").length > 400 ? "…" : ""}
                     </div>
+
+                    {/* What was taken out of it. Shown next to the reply itself
+                        so the claim and its source are read together — this is
+                        the sentence a supplier would be told, and the words it
+                        came from are directly above it. */}
+                    {extracted.get(reply.id)?.map((n) => (
+                      <div
+                        key={n.id}
+                        className="muted"
+                        style={{ fontSize: "0.78rem", marginTop: "0.55rem", paddingTop: "0.45rem", borderTop: "1px solid var(--line, rgba(255,255,255,0.08))" }}
+                      >
+                        <strong>{n.status === "CONFIRMED" ? "Confirmed need" : n.status === "DEAD" ? "Not in the market" : "Noted"}:</strong>{" "}
+                        {n.category}
+                        {n.incumbent ? ` · uses ${n.incumbent}` : ""}
+                        {n.budgetHint ? ` · budget ${n.budgetHint}` : ""}
+                        {n.urgency !== "SOMEDAY" ? ` · ${n.urgency.toLowerCase().replace(/_/g, " ")}` : ""}
+                      </div>
+                    ))}
                   </div>
                 ) : (
                   <p className="muted" style={{ fontSize: "0.82rem", margin: "0.5rem 0 0" }}>

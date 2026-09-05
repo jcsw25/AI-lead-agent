@@ -2,7 +2,8 @@ import type { ReplyClass } from "@prisma/client";
 import { db } from "@/lib/db";
 import { getEmailAdapter } from "@/adapters/email";
 import { accessTokenFor, activeMailbox } from "@/lib/gmail-auth";
-import { hashValue } from "@/lib/gate";
+import { suppressContact } from "@/lib/outreach/suppress";
+import { extractFromReply, type ExtractResult } from "@/lib/demand/extract";
 
 /**
  * Reading replies back in.
@@ -31,6 +32,8 @@ export type PollResult = {
   skippedOwn: number;
   byClass: Record<string, number>;
   unmatched: string[];
+  /** What each reply turned out to say, once read. */
+  extracted: ExtractResult[];
 };
 
 const UNSUBSCRIBE = [
@@ -83,7 +86,9 @@ export function classifyReply(subject: string, text: string): ReplyClass {
 }
 
 export async function pollReplies(businessId: string): Promise<PollResult> {
-  const out: PollResult = { fetched: 0, matched: 0, unsubscribes: 0, skippedOwn: 0, byClass: {}, unmatched: [] };
+  const out: PollResult = {
+    fetched: 0, matched: 0, unsubscribes: 0, skippedOwn: 0, byClass: {}, unmatched: [], extracted: [],
+  };
 
   const mailbox = await activeMailbox(businessId);
   if (!mailbox) throw new Error("No Gmail mailbox connected. Connect one in Settings.");
@@ -142,36 +147,11 @@ export async function pollReplies(businessId: string): Promise<PollResult> {
 
     // Suppression first, before anything else can fail.
     if (replyClass === "UNSUBSCRIBE") {
-      const email = m.fromEmail.toLowerCase();
-      // The gate's own salted hash, not a plain one. It looks suppression up by
-      // hashValue(); an unsalted digest here would never match, so the entry
-      // would stop working the moment the plaintext email is deleted for
-      // right-to-erasure — which is exactly when it has to keep working.
-      const emailHash = hashValue(email);
-      const already = await db.suppressionEntry.findFirst({
-        where: { businessId, emailHash },
-        select: { id: true },
-      });
-      if (!already) {
-        await db.suppressionEntry.create({
-          data: {
-            businessId,
-            scope: "BUSINESS",
-            reason: "UNSUBSCRIBE",
-            email,
-            emailHash,
-            note: "Asked to be removed in a reply.",
-          },
-        });
-      }
-      await db.prospect.updateMany({
-        where: { businessId, companyId: contact.companyId },
-        data: { stage: "SUPPRESSED", disqualifiedReason: "Asked to be removed" },
-      });
+      await suppressContact(businessId, m.fromEmail, "Asked to be removed in a reply.");
       out.unsubscribes++;
     }
 
-    await db.message.create({
+    const inbound = await db.message.create({
       data: {
         businessId,
         mailboxId: mailbox.id,
@@ -225,6 +205,25 @@ export async function pollReplies(businessId: string): Promise<PollResult> {
     out.matched++;
     const k = replyClass;
     out.byClass[k] = (out.byClass[k] ?? 0) + 1;
+
+    // Read what they actually said. This runs here rather than on a schedule so
+    // a confirmed need exists the moment the reply lands — the value of "they
+    // need a supplier now" decays in days, and a nightly job spends the first
+    // of them doing nothing.
+    //
+    // Wrapped because polling must not fail on it. Losing the extraction costs
+    // one model call to redo; losing the poll loses the mailbox cursor, and the
+    // reply itself would never be recorded at all.
+    if (replyClass !== "UNSUBSCRIBE" && replyClass !== "AUTO_REPLY") {
+      try {
+        out.extracted.push(await extractFromReply(businessId, inbound.id));
+      } catch (e) {
+        out.extracted.push({
+          needId: null, companyName: contact.company.name, status: "SKIPPED", costUsd: 0,
+          why: `extraction failed: ${e instanceof Error ? e.message.slice(0, 120) : "unknown"}`,
+        });
+      }
+    }
   }
 
   await db.mailbox.update({

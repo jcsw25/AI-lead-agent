@@ -1,0 +1,12 @@
+import { db } from "@/lib/db";
+const biz = await db.business.findFirstOrThrow({ orderBy: { createdAt: "asc" } });
+const B = { businessId: biz.id };
+console.log(`audits recorded under the OLD logic   ${await db.siteAudit.count({ where: { renderMode: "static", reliable: true } })}`);
+console.log(`needs still only SUSPECTED            ${await db.need.count({ where: { ...B, status: "SUSPECTED" } })}`);
+console.log(`needs CONFIRMED by a reply            ${await db.need.count({ where: { ...B, status: "CONFIRMED" } })}`);
+console.log(`rejected: no contact route            ${await db.qualification.count({ where: { ...B, rejectionReason: "NO_CONTACT_ROUTE" } })}`);
+console.log(`rejected: aggregator                  ${await db.qualification.count({ where: { ...B, rejectionReason: "AGGREGATOR" } })}`);
+console.log(`companies with a nav-label name       ${(await db.company.findMany({ select: { name: true } })).filter((c) => /^(home|about|contact|services|our services|overview|products)$/i.test(c.name.trim()) || c.name.includes(":")).length}`);
+console.log(`sent to a real company                ${await db.message.count({ where: { ...B, status: "SENT", contact: { company: { name: { not: { contains: "Self test" } } } } } })}`);
+console.log(`inbound replies                       ${await db.message.count({ where: { direction: "INBOUND" } })}`);
+await db.$disconnect();

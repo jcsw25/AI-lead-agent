@@ -21,6 +21,14 @@ const STATUS_COPY: Record<string, { label: string; meaning: string; tone: string
   DEAD: { label: "dead", meaning: "They said no, or the window closed.", tone: "lane-CONTRARIAN" },
 };
 
+/** Written as the buyer's own timing, since that is what it records. */
+const URGENCY_COPY: Record<string, string> = {
+  NOW: "wants it now",
+  THIS_QUARTER: "has a date in mind",
+  SOMEDAY: "open, no timing given",
+  NOT_IN_MARKET: "not in the market",
+};
+
 export default async function NeedsPage({
   searchParams,
 }: {
@@ -102,6 +110,61 @@ export default async function NeedsPage({
         </div>
       ) : needs.length === 0 ? (
         <div className="empty"><h3>Nothing at this status</h3></div>
+      ) : status === "CONFIRMED" || status === "FILLED" ? (
+        // A confirmed need is the only thing on this page a supplier is ever
+        // shown, so it gets the whole quote rather than ninety characters of
+        // one. What is on this card is what would be repeated to somebody else,
+        // and it has to be readable in full before it is.
+        <div style={{ display: "grid", gap: "1rem" }}>
+          {needs.map((n) => {
+            const c = n.company;
+            return (
+              <div key={n.id} className="panel">
+                <div style={{ display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
+                  <div>
+                    <strong>{c.name}</strong>
+                    <div className="muted" style={{ fontSize: "0.78rem" }}>
+                      {c.industry} · needs{" "}
+                      <span className={`lane ${STATUS_COPY[n.status].tone}`}>{n.category}</span>
+                    </div>
+                  </div>
+                  <div className="muted" style={{ fontSize: "0.78rem", textAlign: "right" }}>
+                    {URGENCY_COPY[n.urgency] ?? n.urgency}
+                    {n.confirmedAt && <div>confirmed {n.confirmedAt.toLocaleDateString()}</div>}
+                  </div>
+                </div>
+
+                {n.verbatim ? (
+                  <blockquote
+                    style={{
+                      margin: "0.85rem 0 0",
+                      padding: "0.5rem 0 0.5rem 0.9rem",
+                      borderLeft: "3px solid var(--accent, #7aa2f7)",
+                      fontStyle: "italic",
+                    }}
+                  >
+                    &ldquo;{n.verbatim}&rdquo;
+                  </blockquote>
+                ) : (
+                  <p className="notice" style={{ marginTop: "0.75rem", fontSize: "0.85rem" }}>
+                    Confirmed with no quote recorded. That should not be possible — do not repeat this to a
+                    supplier until you have found the reply it came from.
+                  </p>
+                )}
+
+                <div
+                  className="muted"
+                  style={{ fontSize: "0.8rem", marginTop: "0.6rem", display: "flex", gap: "1.25rem", flexWrap: "wrap" }}
+                >
+                  {n.incumbent && <span>currently uses <strong>{n.incumbent}</strong></span>}
+                  {n.budgetHint && <span>budget mentioned: {n.budgetHint}</span>}
+                  {c.contacts[0]?.email && <span>{c.contacts[0].email}</span>}
+                  <span>{n.sourceMessageId ? "traced to their reply" : "no source message — do not quote this"}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       ) : (
         <>
           <div className="scroll">

@@ -108,6 +108,23 @@ export async function sendThroughGate(messageId: string): Promise<GateDecision> 
   });
   if (negative) return block("This contact previously replied negatively or opted out.");
 
+  // 4b. every link in the body must be reachable by the person receiving it
+  //
+  // Report links are built from PUBLIC_BASE_URL, which is localhost until a
+  // real domain exists. A draft written today and approved next month would
+  // carry a link that works on exactly one machine in the world — and unlike a
+  // typo, it looks entirely normal sitting in the approval queue. Cheaper to
+  // make it unsendable than to rely on somebody noticing.
+  const unreachable = (msg.bodyText ?? "").match(
+    /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|[^\s/]*\.local)(?::\d+)?/i,
+  );
+  if (unreachable) {
+    return block(
+      `The body links to ${unreachable[0]}, which only resolves on this machine. ` +
+        `Set PUBLIC_BASE_URL to the real domain and regenerate the draft.`,
+    );
+  }
+
   // 5. channel rules
   if (msg.channel !== "EMAIL") {
     const rule = await db.complianceRule.findFirst({

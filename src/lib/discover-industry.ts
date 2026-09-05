@@ -25,6 +25,12 @@ export type DiscoverIndustryResult = {
   crawled: number;
   skippedKnown: number;
   /**
+   * Results discarded for having neither a website nor a phone. Reported rather
+   * than hidden: a search that finds sixty names and can contact four of them
+   * has told you something about the industry, not about the search.
+   */
+  noContactRoute: number;
+  /**
    * What each search provider did. `skipped` is a deliberate choice, not a
    * problem — it must stay distinct from `error`, because reporting an
    * optimisation as a failure makes a healthy run look broken.
@@ -62,8 +68,52 @@ export async function discoverIndustry(
   const plan = await planQueries(industry, business.region.name, { businessId });
   const planned = plan.queries.map((q) => q.query);
 
-  const found = new Map<string, { name: string; website?: string; phone?: string; address?: string; sourceRef: string }>();
+  const found = new Map<
+    string,
+    { name: string; website?: string; phone?: string; address?: string; sourceRef: string;
+      serpPosition?: number; serpAppearances?: number }
+  >();
   const adapters = getSearchAdapters();
+
+  /**
+   * How long any one provider gets before the search moves on without it.
+   *
+   * Added after a search for "primary tuition center" sat at four minutes with
+   * the button still reading "Searching Google…". Google returned fewer than
+   * thirty results, so the Anthropic web-search adapter was not skipped — and
+   * that one carries a 300-second client timeout. Overpass is a free volunteer
+   * service that allows 90 seconds per attempt and then retries. Between them a
+   * single search could occupy somebody for six minutes with no way to tell
+   * whether it was working or hung.
+   *
+   * Discovery is best-effort by nature: whatever came back by the deadline is
+   * the result. A partial answer now is worth more than a complete one arriving
+   * after the person has given up and reloaded the page.
+   */
+  const ADAPTER_DEADLINE_MS: Record<string, number> = {
+    google: 60_000,
+    anthropic: 90_000,
+    overpass: 45_000,
+  };
+  /** The whole search, across every provider. */
+  const SEARCH_DEADLINE_MS = Number(process.env.DISCOVER_DEADLINE_MS ?? 150_000);
+  const startedAt = Date.now();
+
+  const withDeadline = async <T>(name: string, ms: number, work: Promise<T>): Promise<T> => {
+    let timer: NodeJS.Timeout | undefined;
+    const limit = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`${name} did not answer within ${Math.round(ms / 1000)}s`)),
+        ms,
+      );
+    });
+    try {
+      return await Promise.race([work, limit]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
   // A failing adapter used to be swallowed, so a broken web search looked
   // identical to "there were no results". Record what each one did.
   const adapterLog: DiscoverIndustryResult["adapterLog"] = [];
@@ -84,12 +134,22 @@ export async function discoverIndustry(
       adapterLog.push({ adapter: a.name, found: 0, skipped: "not needed — Google already returned enough" });
       continue;
     }
+    const spent = Date.now() - startedAt;
+    if (spent > SEARCH_DEADLINE_MS) {
+      adapterLog.push({ adapter: a.name, found: 0, skipped: `search deadline reached after ${Math.round(spent / 1000)}s` });
+      continue;
+    }
+
     try {
-      const hits = await a.discover(industry, business.region.name, limit, {
-        exclude: known,
-        queries: planned,
-        negatives: plan.negatives,
-      });
+      const hits = await withDeadline(
+        a.name,
+        Math.min(ADAPTER_DEADLINE_MS[a.name] ?? 60_000, SEARCH_DEADLINE_MS - spent),
+        a.discover(industry, business.region.name, limit, {
+          exclude: known,
+          queries: planned,
+          negatives: plan.negatives,
+        }),
+      );
       adapterLog.push({ adapter: a.name, found: hits.length });
       for (const t of hits) {
         // Chains have several outlets. Keying on name alone collapses them into
@@ -97,7 +157,14 @@ export async function discoverIndustry(
         const key =
           registrableDomain(t.website ?? "") ??
           `${t.name}|${t.address ?? ""}`.toLowerCase().replace(/[^a-z0-9|]/g, "");
-        if (!found.has(key)) found.set(key, t);
+        const prior = found.get(key);
+        if (!prior) { found.set(key, t); continue; }
+        // Same company from a second provider or phrasing: keep the best
+        // position seen and add up the appearances.
+        prior.serpAppearances = (prior.serpAppearances ?? 0) + (t.serpAppearances ?? 0);
+        if (t.serpPosition && (!prior.serpPosition || t.serpPosition < prior.serpPosition)) {
+          prior.serpPosition = t.serpPosition;
+        }
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -109,13 +176,35 @@ export async function discoverIndustry(
   let created = 0;
   let crawled = 0;
   let skippedKnown = 0;
+  /** Found, but with no website and no phone — nothing to act on. */
+  let noContactRoute = 0;
 
   try {
     for (const t of [...found.values()].slice(0, limit)) {
       const domain = registrableDomain(t.website ?? "");
 
+      // A name with no way to reach it is not a lead.
+      //
+      // A search for "primary tuition center" saved 59 companies of which 41
+      // had no website at all — "June Floral Art School", "Academy of Rock",
+      // "Singapore Institute of Technology", and one called "Administration".
+      // They come from OpenStreetMap, which stores a name and a location and
+      // usually nothing else, and they arrive looking exactly like real leads
+      // in the Sheet while being uncontactable and, in those cases, not even
+      // the right kind of business.
+      //
+      // A phone alone is enough — that is what the Calls page is for. A name
+      // alone is a row that costs attention and returns nothing.
+      if (!domain && !t.phone) {
+        noContactRoute++;
+        continue;
+      }
+
       if (domain && crawl) {
-        const r = await ingestDomain(businessId, t.website!, { runId: run.id, knownName: t.name });
+        const r = await ingestDomain(businessId, t.website!, {
+          runId: run.id, knownName: t.name,
+          serpPosition: t.serpPosition, serpAppearances: t.serpAppearances,
+        });
         if (!r.skipped) crawled++;
         else skippedKnown++;
         continue;
@@ -136,6 +225,8 @@ export async function discoverIndustry(
           websiteUrl: t.website,
           addressLine: t.address,
           industry,
+          serpBestPosition: t.serpPosition,
+          serpAppearances: t.serpAppearances ?? 0,
           regionId: business.regionId,
           countryCode: business.region.code,
           city: business.region.name,
@@ -179,7 +270,7 @@ export async function discoverIndustry(
       companiesCreated: created + crawled,
       finishedAt: new Date(),
       log: {
-        industry, limit, found: found.size, created, crawled, skippedKnown,
+        industry, limit, found: found.size, created, crawled, skippedKnown, noContactRoute,
         adapters: adapterLog,
         queries: planned,
         querySource: plan.source,
@@ -197,6 +288,6 @@ export async function discoverIndustry(
     queries: planned,
     querySource: plan.source,
     found: found.size,
-    created, crawled, skippedKnown, adapterLog,
+    created, crawled, skippedKnown, noContactRoute, adapterLog,
   };
 }

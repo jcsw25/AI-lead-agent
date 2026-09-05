@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { db } from "@/lib/db";
+import { pitchPriority } from "@/lib/scoring/pitch-priority";
 import { currentBusiness } from "@/lib/business";
 import { hasApiKey } from "@/agents/runtime";
 import { money } from "@/lib/pipeline";
@@ -17,11 +18,11 @@ export default async function GeneratorPage({
 }: {
   searchParams: Promise<{
     company?: string; notfound?: string; sheeterror?: string;
-    industry?: string; found?: string; saved?: string; drafted?: string;
+    industry?: string; found?: string; saved?: string; drafted?: string; nocontact?: string;
     enriched?: string; emails?: string; phones?: string; remaining?: string; enriching?: string;
   }>;
 }) {
-  const { company: companyId, notfound, sheeterror, industry: shown, found, saved, drafted,
+  const { company: companyId, notfound, sheeterror, industry: shown, found, saved, drafted, nocontact,
     enriched, emails: emailsFound, phones: phonesFound, remaining, enriching: justQueued } = await searchParams;
   const business = await currentBusiness();
   if (!business) return <p>Run <code>npm run db:seed</code> first.</p>;
@@ -71,6 +72,11 @@ export default async function GeneratorPage({
         take: 100,
       })
     : [];
+
+  // Who in this trade has traffic they are losing. Only companies with a
+  // recorded search position appear — reach is the half that decides whether
+  // the pitch is even true.
+  const pitch = shown ? await pitchPriority({ industry: shown, limit: 10, minReach: 1 }) : [];
 
   // The searches that produced this list. Without it a thin result set is
   // indistinguishable from a badly phrased query — you cannot tell whether the
@@ -453,6 +459,46 @@ export default async function GeneratorPage({
         </section>
       </div>
 
+      {/* ---------------- who to pitch first ---------------- */}
+      {shown && pitch.length > 0 && (
+        <div className="panel" style={{ marginTop: "2.5rem" }}>
+          <div className="lane-head" style={{ marginBottom: ".6rem" }}>
+            <h2 style={{ margin: 0 }}>Leaking visitors</h2>
+            <span className="muted" style={{ fontSize: ".8rem" }}>
+              search position x conversion leaks
+            </span>
+          </div>
+          <p className="muted" style={{ fontSize: ".84rem", marginTop: 0 }}>
+            Companies people actually reach, whose site loses them anyway. The two multiply on purpose: a firm with
+            no traffic has a website problem nobody pays for, and a firm converting well has nothing to fix.
+            Position is a free proxy from Google results, not measured traffic.
+          </p>
+          <div className="scroll">
+            <table>
+              <thead>
+                <tr><th>Company</th><th>Google</th><th>Reach</th><th>Leak</th><th>Pitch</th><th>What to open with</th></tr>
+              </thead>
+              <tbody>
+                {pitch.map((t) => (
+                  <tr key={t.companyId}>
+                    <td><strong>{t.name}</strong></td>
+                    <td className="muted" style={{ fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
+                      #{t.serpBestPosition} · {t.serpAppearances}x
+                    </td>
+                    <td style={{ fontVariantNumeric: "tabular-nums" }}>{t.reach}</td>
+                    <td style={{ fontVariantNumeric: "tabular-nums" }}>{t.leak}</td>
+                    <td style={{ fontVariantNumeric: "tabular-nums" }}><strong>{t.priority}</strong></td>
+                    <td className="muted" style={{ fontSize: ".82rem", maxWidth: "26rem" }}>
+                      {t.findings[0] ?? "nothing verified — the site renders in the browser"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* ---------------- industry results ---------------- */}
       {shown && (
         <>
@@ -460,6 +506,17 @@ export default async function GeneratorPage({
             <h2>{shown}</h2>
             <span className="muted">
               {found ?? results.length} found · {saved ?? 0} new · {results.length} in database
+              {Number(nocontact ?? 0) > 0 && (
+                // Said plainly rather than quietly dropped. A search that finds
+                // sixty names and can contact four of them has told you
+                // something about the industry, not about the search.
+                <>
+                  {" · "}
+                  <span title="Found with no website and no phone — usually OpenStreetMap entries, which store a name and a location and nothing else.">
+                    {nocontact} had no way to contact them
+                  </span>
+                </>
+              )}
             </span>
           </div>
 
@@ -635,7 +692,7 @@ export default async function GeneratorPage({
               <h3>No pairing matched</h3>
               <p>
                 Nothing in the library covers this industry yet. Generate pairings for their sector on{" "}
-                <Link href="/pairings">Pairings</Link>, then try again.
+                <Link href="/industry-pairings">Pairings</Link>, then try again.
               </p>
             </div>
           ) : (

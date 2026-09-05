@@ -27,6 +27,18 @@ import { companyNameFrom, isNonBusiness } from "@/lib/entity";
 export type DiscoveredTarget = {
   name: string;
   website?: string;
+  /**
+   * Best organic Google position this company appeared at, and how many of our
+   * search phrasings it showed up for.
+   *
+   * A traffic proxy, not traffic. Real figures need Similarweb, which is paid.
+   * This is free: the discovery searches already run and Serper already returns
+   * the position on every result — it was simply being thrown away. Position 3
+   * across six phrasings is a company people actually reach; position 40 on one
+   * phrasing is not, whatever its website looks like.
+   */
+  serpPosition?: number;
+  serpAppearances?: number;
   phone?: string;
   address?: string;
   lat?: number;
@@ -529,7 +541,7 @@ class SerperAdapter implements SearchAdapter {
         }
 
         const json = (await res.json()) as {
-          organic?: Array<{ title: string; link: string; snippet?: string }>;
+          organic?: Array<{ title: string; link: string; snippet?: string; position?: number }>;
         };
         const items = json.organic ?? [];
         if (!items.length) break; // past the end of this query
@@ -537,7 +549,20 @@ class SerperAdapter implements SearchAdapter {
         const before = seen.size;
         for (const it of items) {
           const domain = registrableDomain(it.link);
-          if (!domain || AGGREGATORS.has(domain) || seen.has(domain) || exclude.has(domain)) continue;
+          if (!domain || AGGREGATORS.has(domain)) continue;
+
+          // Seen already, on an earlier phrasing. Not a duplicate to throw
+          // away: appearing for several of our phrasings is the strongest free
+          // evidence that people actually reach this company, so it counts.
+          const already = seen.get(domain);
+          if (already) {
+            already.serpAppearances = (already.serpAppearances ?? 1) + 1;
+            if (it.position && (!already.serpPosition || it.position < already.serpPosition)) {
+              already.serpPosition = it.position;
+            }
+            continue;
+          }
+          if (exclude.has(domain)) continue;
           // A listicle that outranks the companies it lists is still one domain
           // and would occupy a lead slot. The strategist names the tells.
           if (isDirectory(it.title)) continue;
@@ -547,6 +572,8 @@ class SerperAdapter implements SearchAdapter {
             name: cleanSerpTitle(it.title, domain),
             website: `https://${domain}`,
             phone: phone ? (phone.startsWith("+") ? phone : `+65${phone.slice(-8)}`) : undefined,
+            serpPosition: it.position,
+            serpAppearances: 1,
             source: "google",
             sourceRef: it.link,
           });

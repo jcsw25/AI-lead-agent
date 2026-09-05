@@ -36,6 +36,17 @@ export type PageExtract = {
   uen?: string;
   /** Registered legal name, e.g. "GreenCool Air-Condition Pte Ltd". */
   legalName?: string;
+  /**
+   * The name the company declares in its own structured data.
+   *
+   * The most authoritative name available, and it was going unread. 766 of 977
+   * reachable sites publish JSON-LD, including 72 of the 93 companies whose
+   * stored name collides with another company's — because the name came from a
+   * <title> tag, which on a Singapore SME site is search-engine copy: eleven
+   * different firms called "Aircon Servicing Singapore". Organization.name is
+   * what the business calls itself.
+   */
+  structuredName?: string;
   /** Raw visible text, capped — fed to the model for judgement calls. */
   text: string;
   /**
@@ -222,6 +233,45 @@ function findLegalName(text: string): string | undefined {
   return undefined;
 }
 
+/**
+ * The company's own name from JSON-LD, if it publishes any.
+ *
+ * Only Organization and LocalBusiness types, and only a name that looks like a
+ * name: a schema block describing a Product or a BreadcrumbList also carries a
+ * "name" field, and taking it would swap an SEO title for a product title.
+ */
+export function structuredNameFrom(html: string): string | undefined {
+  const blocks = [...html.matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const b of blocks) {
+    let data: unknown;
+    try {
+      data = JSON.parse(b[1].trim());
+    } catch {
+      continue; // malformed JSON-LD is common and not worth recovering
+    }
+    const nodes: Record<string, unknown>[] = [];
+    const walk = (v: unknown) => {
+      if (Array.isArray(v)) v.forEach(walk);
+      else if (v && typeof v === "object") {
+        nodes.push(v as Record<string, unknown>);
+        const graph = (v as Record<string, unknown>)["@graph"];
+        if (graph) walk(graph);
+      }
+    };
+    walk(data);
+
+    for (const n of nodes) {
+      const type = String(n["@type"] ?? "");
+      if (!/Organization|LocalBusiness|Corporation|Store|ProfessionalService|HomeAndConstructionBusiness/i.test(type)) continue;
+      const name = typeof n.name === "string" ? n.name.replace(/\s+/g, " ").trim() : "";
+      // A name, not a tagline. Long strings here are usually the site's
+      // description pasted into the wrong field.
+      if (name.length >= 2 && name.length <= 70) return name;
+    }
+  }
+  return undefined;
+}
+
 export function extractFromHtml(html: string, pageUrl: string): PageExtract {
   const $ = cheerio.load(html);
   $("script, style, noscript, svg").remove();
@@ -326,6 +376,7 @@ export function extractFromHtml(html: string, pageUrl: string): PageExtract {
     url: pageUrl,
     uen: findUen(bodyText),
     legalName: findLegalName(bodyText),
+    structuredName: structuredNameFrom(html),
     likelyJsRendered: html.length > 20000 && bodyText.length < 800,
     title: $("title").first().text().trim() || undefined,
     description: $('meta[name="description"]').attr("content")?.trim(),

@@ -1,4 +1,6 @@
 import * as cheerio from "cheerio";
+import { detectRenderMode, type RenderMode } from "./render-mode";
+import { detectLeaks, type LeakResult } from "./leaks";
 
 /**
  * What a company's website measurably is.
@@ -33,8 +35,21 @@ export type SiteAuditResult = {
   socialCount: number;
   pagesFetched: number;
   jsRendered: boolean;
+  renderMode: RenderMode;
+  /** False when the page renders client-side: absences cannot be believed. */
+  reliable: boolean;
   score: number;
   findings: string[];
+  /**
+   * Where a visitor who already wants to buy gets lost.
+   *
+   * Separate from `score` on purpose, and pointing the other way: `score` is
+   * how good the site is, `leak.leakScore` is how much business it is losing.
+   * A firm with no form and no traffic has a website problem nobody pays for;
+   * a firm with real traffic and a booking form 80% down the page is losing
+   * money every day, and that is the conversation worth having.
+   */
+  leak: LeakResult;
 };
 
 /** Weights sum to 100. Each one is a thing a buyer would actually notice. */
@@ -59,6 +74,11 @@ export function auditHomepage(
 ): SiteAuditResult {
   const $ = cheerio.load(html);
   const findings: string[] = [];
+
+  // Decided first, because it governs what the rest of this function is
+  // allowed to conclude. On a client-rendered page a missing form means we
+  // could not see one, not that there isn't one.
+  const render = detectRenderMode(html, $("body").text());
 
   const httpsOk = url.startsWith("https://");
 
@@ -117,13 +137,24 @@ export function auditHomepage(
   else findings.push("no mobile viewport tag — the site does not adapt to phones");
 
   if (hasContactForm) score += WEIGHTS.hasContactForm;
-  else findings.push("no enquiry form — a visitor ready to buy has to find another way to ask");
+  else if (render.reliable) {
+    findings.push("no enquiry form — a visitor ready to buy has to find another way to ask");
+  } else {
+    // Credit it rather than penalise it. Scoring a site down for something we
+    // could not see punishes modern sites for being modern.
+    score += WEIGHTS.hasContactForm;
+  }
 
   if (hasEmailLink || hasPhoneLink) score += WEIGHTS.contactLink;
-  else findings.push("no clickable email or phone link");
+  else if (render.reliable) findings.push("no clickable email or phone link");
+  else score += WEIGHTS.contactLink;
 
   if (hasStructured) score += WEIGHTS.structured;
-  else findings.push("no structured data — search engines cannot read the business details");
+  else if (render.reliable) {
+    findings.push("no structured data — search engines cannot read the business details");
+  } else {
+    score += WEIGHTS.structured;
+  }
 
   if (copyrightYear === null) {
     score += WEIGHTS.fresh / 2;
@@ -139,12 +170,19 @@ export function auditHomepage(
   else findings.push(`homepage HTML is ${(pageBytes / 1_000_000).toFixed(1)}MB — slow on a phone`);
 
   if (socialCount > 0) score += WEIGHTS.social;
-  else findings.push("no social profiles linked");
+  else if (render.reliable) findings.push("no social profiles linked");
+  else score += WEIGHTS.social;
 
-  if (meta.jsRendered) findings.push("content is JavaScript-rendered — search engines may see an empty page");
+  if (!render.reliable) {
+    findings.push(
+      `page renders in the browser (${render.mode}: ${render.signals[0] ?? "client-side"}) — ` +
+        `what is missing from the HTML may still be on the site, so nothing above is asserted as absent`,
+    );
+  }
 
   return {
     reachable: true,
+    leak: detectLeaks(html, render.reliable),
     httpsOk,
     mobileViewport,
     hasContactForm,
@@ -157,7 +195,9 @@ export function auditHomepage(
     copyrightYear,
     socialCount,
     pagesFetched: meta.pagesFetched ?? 1,
-    jsRendered: Boolean(meta.jsRendered),
+    jsRendered: Boolean(meta.jsRendered) || !render.reliable,
+    renderMode: render.mode,
+    reliable: render.reliable,
     score: Math.round(Math.min(100, score)),
     findings,
   };
@@ -167,6 +207,15 @@ export function auditHomepage(
 export function unreachableAudit(reason: string): SiteAuditResult {
   return {
     reachable: false,
+    leak: {
+      signals: {
+        missingH1: false, noAboveFoldCta: false, formDepthPct: null,
+        distinctPrices: 0, priceExamples: [], hasPopup: false,
+        carouselHeroNoHeadline: false, approxPageLength: 0,
+      },
+      leakScore: 0,
+      findings: [],
+    },
     httpsOk: false,
     mobileViewport: false,
     hasContactForm: false,
@@ -180,6 +229,8 @@ export function unreachableAudit(reason: string): SiteAuditResult {
     socialCount: 0,
     pagesFetched: 0,
     jsRendered: false,
+    renderMode: "static",
+    reliable: false,
     score: 0,
     findings: [`site could not be opened: ${reason}`],
   };

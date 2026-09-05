@@ -1,7 +1,8 @@
 import { db } from "@/lib/db";
 import { crawlCompanySite, scrapeQuality, type CompanyScrape } from "./crawl";
 import { registrableDomain } from "@/lib/domain";
-import { sendableEmails, isNonBusiness } from "@/lib/entity";
+import { sendableEmails, isNonBusiness, displayCompanyName } from "@/lib/entity";
+import { isNotACompany, looksForeign, normaliseIndustry } from "@/lib/ingest-guards";
 
 /**
  * Turns a scrape into database records.
@@ -29,10 +30,35 @@ export type IngestResult = {
 export async function ingestDomain(
   businessId: string,
   input: string,
-  opts: { pairingId?: string; asSupplierLead?: boolean; runId?: string; knownName?: string } = {},
+  opts: {
+    pairingId?: string; asSupplierLead?: boolean; runId?: string; knownName?: string;
+    /** Traffic proxy from the search that found them. See Company.serpBestPosition. */
+    serpPosition?: number; serpAppearances?: number;
+  } = {},
 ): Promise<IngestResult> {
   const domain = registrableDomain(input);
   if (!domain) return { domain: input, created: false, contactsCreated: 0, foreignEmails: [], emails: 0, phones: 0, tier: "THIN", score: 0, skipped: "invalid domain" };
+
+  // Refused at the door rather than filtered later.
+  //
+  // The audit found 51 of these already stored — four Singapore government
+  // agencies, a Hong Kong legislation site classified as HVAC, wordpress.com,
+  // blogspot.com and several directories. Emailing a regulator a commercial
+  // pitch is the kind of mistake that is remembered, and each one also cost a
+  // crawl to acquire.
+  const notACompany = isNotACompany(domain);
+  if (notACompany) {
+    return {
+      domain, created: false, contactsCreated: 0, foreignEmails: [], emails: 0, phones: 0,
+      tier: "THIN", score: 0, skipped: notACompany,
+    };
+  }
+  if (looksForeign(domain)) {
+    return {
+      domain, created: false, contactsCreated: 0, foreignEmails: [], emails: 0, phones: 0,
+      tier: "THIN", score: 0, skipped: "operates outside Singapore",
+    };
+  }
 
   const scrape = await crawlCompanySite(input);
   if (!scrape) return { domain, created: false, contactsCreated: 0, foreignEmails: [], emails: 0, phones: 0, tier: "THIN", score: 0, skipped: "crawl failed" };
@@ -53,7 +79,16 @@ export async function ingestDomain(
     update: {
       // A name from the search result ("Airple", "Jetstyle Aircon Servicing")
       // beats a scraped page title, which is usually SEO copy.
-      name: opts.knownName || scrape.legalName || scrape.name || existing?.name || domain,
+      // Run through displayCompanyName so a scraped page heading never becomes
+      // the stored name. 166 rows carry one today — "Aircon Servicing
+      // Singapore" against eleven different businesses — and the fix used to
+      // live in the email writer, which meant every other consumer inherited
+      // the bad value.
+      name:
+        displayCompanyName(
+          opts.knownName || scrape.legalName || scrape.name || existing?.name || domain,
+          domain,
+        ) ?? domain,
       legalName: scrape.legalName ?? existing?.legalName,
       description: scrape.description ?? existing?.description,
       websiteUrl: scrape.websiteUrl,
@@ -61,10 +96,12 @@ export async function ingestDomain(
       lastResearchedAt: new Date(),
       researchVersion: { increment: 1 },
       verification: "VERIFIED",
+      ...(opts.serpPosition ? { serpBestPosition: opts.serpPosition } : {}),
+      ...(opts.serpAppearances ? { serpAppearances: opts.serpAppearances } : {}),
     },
     create: {
       primaryDomain: domain,
-      name: opts.knownName || scrape.legalName || scrape.name || domain,
+      name: displayCompanyName(opts.knownName || scrape.legalName || scrape.name || domain, domain) ?? domain,
       legalName: scrape.legalName,
       description: scrape.description,
       websiteUrl: scrape.websiteUrl,
@@ -72,6 +109,8 @@ export async function ingestDomain(
       regionId: business.regionId,
       verification: "VERIFIED",
       lastResearchedAt: new Date(),
+      serpBestPosition: opts.serpPosition,
+      serpAppearances: opts.serpAppearances ?? 0,
     },
   });
 
@@ -85,9 +124,17 @@ export async function ingestDomain(
       reachable: a.reachable, httpsOk: a.httpsOk, mobileViewport: a.mobileViewport,
       hasContactForm: a.hasContactForm, hasEmailLink: a.hasEmailLink, hasPhoneLink: a.hasPhoneLink,
       hasStructured: a.hasStructured, jsRendered: a.jsRendered,
+      renderMode: a.renderMode, reliable: a.reliable,
       pageBytes: a.pageBytes, loadMs: a.loadMs, titleLength: a.titleLength,
       copyrightYear: a.copyrightYear, socialCount: a.socialCount, pagesFetched: a.pagesFetched,
       score: a.score, findings: a.findings as object, checkedAt: new Date(),
+      leakScore: a.leak.leakScore,
+      leakFindings: a.leak.findings as object,
+      missingH1: a.leak.signals.missingH1,
+      noAboveFoldCta: a.leak.signals.noAboveFoldCta,
+      formDepthPct: a.leak.signals.formDepthPct,
+      distinctPrices: a.leak.signals.distinctPrices,
+      hasPopup: a.leak.signals.hasPopup,
     };
     await db.siteAudit.upsert({
       where: { companyId: company.id },

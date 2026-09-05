@@ -351,6 +351,8 @@ model Business {
   matchmakes      Matchmake[]
   needs           Need[]
   changeLog       ChangeLog[]
+  acquisitionTargets AcquisitionTarget[]
+  siteReports     SiteReport[]
 
   @@index([regionId])
   @@map("businesses")
@@ -706,6 +708,9 @@ model Match {
 // they hire one after a conversation that named their problem correctly.
 // ---------------------------------------------------------------------------
 
+/// UNUSED. Never written to. Kept because the discovery-call stage is a real
+/// part of the intended flow that has not been reached — nothing has been sold
+/// yet. Delete if that changes.
 model DiscoveryCall {
   id         String  @id @default(cuid())
   businessId String
@@ -739,6 +744,7 @@ model DiscoveryCall {
   @@map("discovery_calls")
 }
 
+/// UNUSED. Never written to. Depends on DiscoveryCall, which has also never run.
 model SolutionProposal {
   id              String  @id @default(cuid())
   businessId      String
@@ -896,6 +902,29 @@ model Company {
   lastResearchedAt DateTime?
   researchVersion  Int                @default(0)
 
+  /// Best organic Google position we have seen this company at, and how many
+  /// of our search phrasings it appeared for.
+  ///
+  /// A traffic proxy, not traffic. Real numbers need Similarweb, which is paid;
+  /// this is free because the discovery searches already run and Serper already
+  /// returns the position — it was simply being discarded. Position 3 across
+  /// six phrasings is a company people actually reach; position 40 on one is
+  /// not, whatever its site looks like.
+  serpBestPosition Int?
+  serpAppearances  Int  @default(0)
+
+  /// Worked to the front of a queue by hand, from the Leaks list.
+  ///
+  /// Two fields rather than one because the two queues are different jobs. A
+  /// company worth calling today is not always one worth emailing today — the
+  /// leak might be something you want to hear them describe on the phone rather
+  /// than name in writing.
+  ///
+  /// Timestamps rather than booleans so the most recently pinned sits at the
+  /// top, and so "when did I decide this mattered" survives.
+  pinnedForCallAt  DateTime?
+  pinnedForEmailAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -915,6 +944,8 @@ model Company {
   matchmakeAsB   Matchmake[]    @relation("MatchmakeB")
   suppliers   Supplier[]
   supplierLeads SupplierLead[]
+  acquisitionTargets AcquisitionTarget[]
+  siteReports SiteReport[]
 
   @@index([regionId, industry])
   @@index([name])
@@ -1045,6 +1076,14 @@ model SeasonalWindow {
   @@map("seasonal_windows")
 }
 
+/// UNUSED, AND DELIBERATELY SO.
+///
+/// Nothing produces buying signals, because funding rounds, hiring sprees and
+/// expansion announcements are enterprise phenomena that a twelve-person
+/// Singapore aircon firm does not publish. The outreach writer read this table
+/// for its verified facts and therefore received none, for every email ever
+/// drafted — see src/lib/facts.ts, which now supplies them from what companies
+/// actually publish about themselves.
 model BuyingSignal {
   id        String     @id @default(cuid())
   companyId String
@@ -1222,6 +1261,9 @@ model ValueProposition {
 // CAMPAIGNS + MESSAGING (spec sections 8, 9)
 // ---------------------------------------------------------------------------
 
+/// UNUSED. Never written to. Sequenced campaigns were superseded by one-off
+/// drafting through the approval queue, which suits the volume this operates at.
+/// Message.campaignId still references it, so it is kept rather than dropped.
 model Campaign {
   id         String @id @default(cuid())
   businessId String
@@ -1381,6 +1423,18 @@ model Message {
   replyClass      ReplyClass?
   classifierRunId String?
   classifierNotes String?     @db.Text
+
+  /// The message this one follows up.
+  ///
+  /// Follow-ups were being written and thrown away: the writer produced two per
+  /// email, returned them, and nothing stored them. Most replies to cold email
+  /// come from the second and third touch, so that was the majority of the
+  /// value being generated and discarded.
+  parentMessageId String?
+
+  /// What happened, for touches that are not email. A call has an outcome
+  /// ("no answer", "spoke to the owner") where an email has a status.
+  outcome String?
 
   agentRunId String?
   createdAt  DateTime @default(now())
@@ -1837,6 +1891,15 @@ model SiteAudit {
   hasStructured  Boolean @default(false)
   jsRendered     Boolean @default(false)
 
+  /// static | hydrated | spa — how the page delivers its content.
+  ///
+  /// This decides whether an ABSENCE can be believed. On a hydrated or SPA
+  /// page the enquiry form is built by JavaScript and simply is not in the HTML
+  /// we read, so "no enquiry form" is not a finding, it is a blind spot.
+  renderMode   String  @default("static")
+  /// False when the page renders client-side and absences cannot be trusted.
+  reliable     Boolean @default(true)
+
   pageBytes    Int?
   loadMs       Int?
   titleLength  Int?
@@ -1849,6 +1912,28 @@ model SiteAudit {
   score     Int      @default(0)
   /// Human-readable findings, each one traceable to a field above.
   findings  Json?
+
+  /// Where a visitor who already wants to buy gets lost.
+  ///
+  /// The fields above answer "can they be contacted at all". These answer the
+  /// next question: the visitor arrived, they were interested, and the page
+  /// lost them anyway. Higher leakScore means MORE business lost — it measures
+  /// the problem, not the site, and points the opposite way to `score`.
+  ///
+  /// All of it is gated on `reliable`: on a page assembled in the browser the
+  /// headline and the button may both exist, so a client-rendered site records
+  /// zero leaks rather than a clean bill of health.
+  leakScore      Int     @default(0)
+  leakFindings   Json?
+  missingH1      Boolean @default(false)
+  noAboveFoldCta Boolean @default(false)
+  /// How far down the document the first real enquiry form sits, as a percent.
+  formDepthPct   Int?
+  /// Distinct money figures on one page. Four prices for one service is the
+  /// commonest trust-killer in this trade.
+  distinctPrices Int     @default(0)
+  hasPopup       Boolean @default(false)
+
   checkedAt DateTime @default(now())
 
   company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
@@ -2143,4 +2228,141 @@ model ChangeLog {
 
   @@index([createdAt])
   @@map("change_log")
+}
+
+/// Where a target came from, which decides how it is approached.
+enum AcquisitionOrigin {
+  LISTED      // advertised for sale on a marketplace or by a broker
+  PROPRIETARY // nobody has said it is for sale; we asked first
+}
+
+/// How far a conversation about buying the business has actually got.
+///
+/// The ladder is deliberately the same shape as NeedStatus: each rung is a
+/// thing the other side did, not a thing we hope they will do. INTERESTED means
+/// they wrote back and said they would consider it, and it carries the reply.
+enum AcquisitionStatus {
+  IDENTIFIED // found. Nobody has been contacted.
+  APPROACHED // we asked. No answer yet.
+  INTERESTED // they said they would consider selling.
+  NDA_SIGNED // an NDA is executed both ways.
+  FINANCIALS // they sent numbers.
+  LOI        // a letter of intent is on the table.
+  DEAD       // not selling, or we passed.
+}
+
+/// A company worth buying.
+///
+/// Two origins, one table, because the pipeline after first contact is
+/// identical — NDA, financials, LOI — and splitting it would mean maintaining
+/// the same ladder twice. What differs is only how the first email reads: a
+/// LISTED business advertised itself and expects enquiries, while a PROPRIETARY
+/// one is being asked a question nobody asked it.
+model AcquisitionTarget {
+  id         String  @id @default(cuid())
+  businessId String
+  /// Set when the target is a company we already hold. Null for a listing that
+  /// is anonymised, which most brokered ones are.
+  companyId  String?
+
+  origin AcquisitionOrigin
+  status AcquisitionStatus @default(IDENTIFIED)
+
+  name       String
+  industry   String?
+  websiteUrl String?
+
+  /// The advertisement. Unique so the same listing found through two searches
+  /// does not become two targets.
+  listingUrl     String? @unique
+  listingSource  String?
+  listingTitle   String?
+  listingSummary String? @db.Text
+  /// Why they say they are selling. Retirement and relocation are the ones
+  /// worth answering fastest.
+  sellerReason   String? @db.Text
+  listedAt       DateTime?
+
+  currency         String   @default("SGD")
+  askingPrice      Decimal? @db.Decimal(14, 2)
+  revenue          Decimal? @db.Decimal(14, 2)
+  ebitda           Decimal? @db.Decimal(14, 2)
+  employeeCount    Int?
+  yearsEstablished Int?
+
+  /// Exactly what the listing called its profit figure. "EBITDA", "Net Profit",
+  /// "SDE", "Monthly profit" — these are different metrics and listings use them
+  /// interchangeably, so the word is kept rather than normalised away.
+  profitTerm String?
+
+  /// Asking price over EBITDA. Arithmetic on two stored numbers, never a
+  /// model's opinion — the same rule the scoring engine runs under.
+  ///
+  /// Null unless the listing's own profit figure IS EBITDA. Computing it across
+  /// terms was measured and rejected: a preschool quoting a MONTHLY profit of
+  /// 20,000 against a 520,000 price produced "26x", where the real annual
+  /// multiple is about 2.2. Showing that beside a genuine EBITDA multiple
+  /// invites exactly the comparison that must not be made.
+  askingMultiple Float?
+
+  /// Their own words, from a reply. Same rule as Need: a quote comes from a
+  /// message we received, or it does not exist.
+  verbatim         String? @db.Text
+  sourceMessageId  String?
+  /// The approach we sent, so reply rate per industry is measurable.
+  enquiryMessageId String?
+
+  notes        String?   @db.Text
+  approachedAt DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  company  Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  @@unique([businessId, companyId])
+  @@index([businessId, status, origin])
+  @@map("acquisition_targets")
+}
+
+/// A free, shareable report on one company's website.
+///
+/// The lead magnet. The audit engine already scores every company on things a
+/// visitor can verify — HTTPS, a mobile viewport, whether there is any way to
+/// ask for a quote — and that was only ever used internally, as a scoring input
+/// and an opening line. Given away it is worth far more: it turns the ask from
+/// "will you give me twenty minutes" into "would you like a free thing", which
+/// is the lowest-friction ask there is.
+///
+/// The token exists so the link can be public without exposing an internal id,
+/// and viewedAt is the point of the whole thing — a company that opened its
+/// report is a warmer lead than one that replied politely, and it is the only
+/// buying signal available before anyone speaks.
+model SiteReport {
+  id         String @id @default(cuid())
+  businessId String
+  companyId  String
+
+  /// Random, URL-safe, unguessable. The report is not secret but it is not
+  /// enumerable either.
+  token String @unique
+
+  /// Opens. A second view usually means it was forwarded to somebody else,
+  /// which is a stronger signal than the first.
+  viewCount  Int       @default(0)
+  firstViewedAt DateTime?
+  lastViewedAt  DateTime?
+
+  /// The message that carried the link, so open rate per campaign is knowable.
+  messageId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  company  Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, companyId])
+  @@index([businessId, firstViewedAt])
+  @@map("site_reports")
 }

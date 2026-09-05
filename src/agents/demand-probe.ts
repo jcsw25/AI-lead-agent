@@ -55,8 +55,13 @@ know whether there is a real need — and the cheapest way to find that out is t
 rather than to guess and pitch. An answer of "we're happy with ours" is a good outcome: it
 names the incumbent, confirms the category is live, and tells you when to come back.
 
-STRUCTURE — three short paragraphs, and the middle one is the point
+STRUCTURE — a greeting and three short paragraphs, and the middle one is the point
 
+0. GREET THEM. "Hi <first name>," only when you were given a real person's name; "Hi
+   there," whenever it is a shared mailbox, which here it almost always is. Never invent a
+   name, and never make one out of the company or the mailbox — contact records in this
+   market read "prosupport", "feedback" and "Coolaircon (hello)", so "Hi feedback," is
+   worse than using no name at all.
 1. Who you are, in one line, honestly. You connect businesses with suppliers.
 2. THE QUESTION. One question, about how they handle <category> today. Answerable in five
    words. This is the entire purpose of the email.

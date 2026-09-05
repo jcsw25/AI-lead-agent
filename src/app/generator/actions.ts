@@ -12,7 +12,7 @@ import { registrableDomain } from "@/lib/domain";
 function refresh() {
   revalidatePath("/generator");
   revalidatePath("/leads");
-  revalidatePath("/pairings");
+  revalidatePath("/industry-pairings");
   revalidatePath("/");
 }
 
@@ -75,7 +75,8 @@ export async function searchIndustry(businessId: string, formData: FormData) {
   // which reads as "nothing happened".
   redirect(
     `/generator?industry=${encodeURIComponent(industry)}&found=${r.found}&saved=${r.created + r.crawled}` +
-      `&skipped=${r.skippedKnown}${enriching ? `&enriching=${enriching}` : ""}`,
+      `&skipped=${r.skippedKnown}&nocontact=${r.noContactRoute}` +
+      `${enriching ? `&enriching=${enriching}` : ""}`,
   );
 }
 

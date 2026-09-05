@@ -32,3 +32,7 @@ revenue-agent-package/
 *.pem
 *-key.json
 service-account*.json
+
+# TypeScript incremental build cache. A machine-local artefact that changes on
+# every compile and conflicts on every merge.
+tsconfig.tsbuildinfo

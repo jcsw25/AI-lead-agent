@@ -1,7 +1,7 @@
 import { CONTACT_PATHS, politeFetch } from "./fetcher";
 import { extractFromHtml, isRoleBased, type ExtractedContact, type PageExtract } from "./extract";
 import { registrableDomain } from "@/lib/domain";
-import { companyNameFrom } from "@/lib/entity";
+import { companyNameFrom, displayCompanyName } from "@/lib/entity";
 import { auditHomepage, unreachableAudit, type SiteAuditResult } from "./audit";
 
 /**
@@ -143,7 +143,25 @@ export async function crawlCompanySite(input: string): Promise<CompanyScrape | n
   result.jsRendered = extracts.length > 0 && extracts.every((e) => e.likelyJsRendered);
   result.uen = extracts.find((e) => e.uen)?.uen;
   result.legalName = extracts.find((e) => e.legalName)?.legalName;
-  result.name = result.legalName ?? companyNameFrom(home?.title, domain);
+
+  // Name preference, best source first.
+  //
+  // The <title> tag was second in line and is the worst of the three: on a
+  // Singapore SME site it is search-engine copy, which is how eleven different
+  // firms came to be stored as "Aircon Servicing Singapore". JSON-LD
+  // Organization.name is what the business calls itself, and 766 of 977
+  // reachable sites publish it — including 72 of the 93 companies whose stored
+  // name still collides with somebody else's.
+  // Structured data wins only where the title-derived name is generic, not
+  // always. Tested against colliding companies: it turns "Aircon Servicing
+  // Singapore" into "Mastercool", which is the whole point — but it also turns
+  // "Impress Gift" into "Kytelink", which may be a platform or a parent rather
+  // than the trading name. Where the title already yields something specific,
+  // there is nothing to gain and something to lose.
+  const structured = extracts.find((e) => e.structuredName)?.structuredName;
+  const fromTitle = companyNameFrom(home?.title, domain);
+  const titleIsGeneric = displayCompanyName(fromTitle, domain) !== fromTitle;
+  result.name = result.legalName ?? (titleIsGeneric && structured ? structured : fromTitle);
   result.description = home?.description;
   result.emails = [...emails.values()].sort((a, b) => Number(a.isRoleBased) - Number(b.isRoleBased));
   result.phones = [...phones.values()];

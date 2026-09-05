@@ -10,7 +10,7 @@ import { draftSideB } from "@/lib/outreach/draft-buyer";
 
 function refresh() {
   revalidatePath("/introductions");
-  revalidatePath("/pairings");
+  revalidatePath("/industry-pairings");
   revalidatePath("/");
 }
 

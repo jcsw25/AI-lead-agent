@@ -1,7 +1,7 @@
 import { db } from "@/lib/db";
 import { currentBusiness } from "@/lib/business";
 import { hasApiKey } from "@/agents/runtime";
-import { draftRecruitmentEmail, onboardSupplier, setLeadStatus } from "../pairings/actions";
+import { draftRecruitmentEmail, onboardSupplier, setLeadStatus } from "../industry-pairings/actions";
 
 export const dynamic = "force-dynamic";
 
@@ -63,7 +63,7 @@ export default async function LeadsPage() {
         <div className="empty">
           <h3>Database is empty</h3>
           <p>Go to Pairings, pick a thesis, and paste supplier websites to scrape.</p>
-          <a className="btn" href="/pairings">Open pairings</a>
+          <a className="btn" href="/industry-pairings">Open pairings</a>
         </div>
       ) : (
         <div className="grid">

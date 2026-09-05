@@ -357,6 +357,138 @@ export function tabsFromExport(data: {
   ];
 }
 
+
+/**
+ * Read a tab back, as rows of strings.
+ *
+ * The push side of this file is deliberately destructive — clear-then-write, so
+ * the Sheet always matches the database. That is right for tabs the database
+ * owns, and exactly wrong for one a human types into: the Calls tab is meant to
+ * be edited by hand, so it has to be read before it is written or the first
+ * sync eats the morning's notes.
+ *
+ * Returns [] rather than throwing when the tab does not exist yet, since "not
+ * created" and "empty" mean the same thing to the caller.
+ */
+export async function readTab(
+  token: string,
+  spreadsheetId: string,
+  title: string,
+): Promise<string[][]> {
+  try {
+    const json = (await call(
+      `/${spreadsheetId}/values/${encodeURIComponent(title)}?majorDimension=ROWS`,
+      token,
+    )) as { values?: string[][] };
+    return json.values ?? [];
+  } catch (e) {
+    if (e instanceof Error && /\b400\b|Unable to parse range/i.test(e.message)) return [];
+    throw e;
+  }
+}
+
+/** Create a tab if it is missing. Safe to call every sync. */
+export async function ensureTab(token: string, spreadsheetId: string, title: string) {
+  const meta = (await call(`/${spreadsheetId}?fields=sheets.properties`, token)) as {
+    sheets?: Array<{ properties: { title: string; sheetId: number } }>;
+  };
+  const found = (meta.sheets ?? []).find((x) => x.properties.title === title);
+  if (found) return found.properties.sheetId;
+
+  const made = (await call(`/${spreadsheetId}:batchUpdate`, token, {
+    method: "POST",
+    body: JSON.stringify({ requests: [{ addSheet: { properties: { title, gridProperties: { frozenRowCount: 1 } } } }] }),
+  })) as { replies?: Array<{ addSheet?: { properties?: { sheetId?: number } } }> };
+  return made.replies?.[0]?.addSheet?.properties?.sheetId ?? 0;
+}
+
+/** Write one tab without clearing the rest of the spreadsheet. */
+export async function writeTab(token: string, spreadsheetId: string, tab: SheetTab) {
+  await call(`/${spreadsheetId}/values/${encodeURIComponent(tab.title)}:clear`, token, {
+    method: "POST",
+    body: "{}",
+  });
+  await call(
+    `/${spreadsheetId}/values/${encodeURIComponent(`${tab.title}!A1`)}?valueInputOption=USER_ENTERED`,
+    token,
+    { method: "PUT", body: JSON.stringify({ values: [tab.headers, ...tab.rows] }) },
+  );
+}
+
+/**
+ * Dress a hand-edited tab: header styling, frozen row, a dropdown on one
+ * column, and grey text on the columns the database owns.
+ *
+ * The dropdown matters more than it looks. Outcomes are matched back by exact
+ * string, so a typed "no answer" against an expected "No answer" is a row that
+ * silently does nothing — a picker removes the whole class of problem.
+ */
+export async function formatCallsTab(
+  token: string,
+  spreadsheetId: string,
+  sheetId: number,
+  opts: { outcomes: readonly string[]; outcomeColumn: number; readOnlyThrough: number; idColumn: number },
+) {
+  await call(`/${spreadsheetId}:batchUpdate`, token, {
+    method: "POST",
+    body: JSON.stringify({
+      requests: [
+        {
+          repeatCell: {
+            range: { sheetId, startRowIndex: 0, endRowIndex: 1 },
+            cell: {
+              userEnteredFormat: {
+                textFormat: { bold: true, foregroundColor: { red: 1, green: 1, blue: 1 } },
+                backgroundColor: { red: 0.06, green: 0.39, blue: 0.4 },
+              },
+            },
+            fields: "userEnteredFormat(textFormat,backgroundColor)",
+          },
+        },
+        {
+          updateSheetProperties: {
+            properties: { sheetId, gridProperties: { frozenRowCount: 1 } },
+            fields: "gridProperties.frozenRowCount",
+          },
+        },
+        // The columns the database owns, greyed so it is visible at a glance
+        // which cells are safe to type in and which get overwritten.
+        {
+          repeatCell: {
+            range: { sheetId, startRowIndex: 1, startColumnIndex: 0, endColumnIndex: opts.readOnlyThrough },
+            cell: { userEnteredFormat: { textFormat: { foregroundColor: { red: 0.42, green: 0.46, blue: 0.51 } } } },
+            fields: "userEnteredFormat.textFormat.foregroundColor",
+          },
+        },
+        {
+          setDataValidation: {
+            range: {
+              sheetId,
+              startRowIndex: 1,
+              startColumnIndex: opts.outcomeColumn,
+              endColumnIndex: opts.outcomeColumn + 1,
+            },
+            rule: {
+              condition: { type: "ONE_OF_LIST", values: opts.outcomes.map((o) => ({ userEnteredValue: o })) },
+              showCustomUi: true,
+              strict: false,
+            },
+          },
+        },
+        // The key column, narrowed and greyed. It is how a row finds its way
+        // back to a record; losing it turns an edit into a new lead.
+        {
+          repeatCell: {
+            range: { sheetId, startRowIndex: 1, startColumnIndex: opts.idColumn, endColumnIndex: opts.idColumn + 1 },
+            cell: { userEnteredFormat: { textFormat: { fontSize: 8, foregroundColor: { red: 0.7, green: 0.73, blue: 0.76 } } } },
+            fields: "userEnteredFormat.textFormat",
+          },
+        },
+      ],
+    }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // One-call sync used by the app.
 // ---------------------------------------------------------------------------

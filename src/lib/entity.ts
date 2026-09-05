@@ -173,6 +173,149 @@ export function nameFromDomain(domain: string): string {
 }
 
 /**
+ * Words that describe a page rather than name a company.
+ *
+ * A name made entirely of these is a scraped heading, not a business.
+ */
+const HEADING_WORDS = new Set([
+  "our", "the", "and", "&", "us", "we", "your",
+  "services", "service", "capabilities", "capability", "solutions", "products", "product",
+  "about", "contact", "home", "welcome", "overview", "profile", "company", "companies",
+  "expertise", "offerings", "works", "portfolio", "gallery", "info", "information",
+  "page", "site", "website", "main", "index",
+  // "Get in Touch" reached the pitch list as a company name.
+  "get", "touch", "in", "here", "more", "learn", "read", "view", "see",
+]);
+
+/**
+ * Names that are an article headline rather than a business.
+ *
+ * "The Vital Role of Elevator Maintenance" was ranked #6 in the pitch list as
+ * though it were a company. It is a blog post title, and the heading-words test
+ * cannot catch it because "vital", "role" and "elevator" are all real words a
+ * company might use. The shape is the tell: an English sentence with an article
+ * and a preposition in it, which company names almost never have.
+ */
+const ARTICLE_TITLE =
+  /^(the|a|an|why|how|what|when|where|top \d+|\d+ (?:ways|tips|reasons|things))\b.*\b(of|for|to|in|that|your|you)\b/i;
+
+/**
+ * A name fit to put in an email, or null if the row has none.
+ *
+ * PAGE_TITLES only matches a title that is EXACTLY a page name, so "OUR
+ * SERVICES & CAPABILITIES" walked past it at ingest and reached a live draft —
+ * an email that told the recipient it had "ended up on your Our Services &
+ * Capabilities page". A name made of nothing but heading words is checked here
+ * as a whole rather than against a fixed list, because the combinations are
+ * endless and the words are few.
+ *
+ * The optional industry catches the other failure: a name identical to the
+ * trade itself. Searching "aircon" produced several companies literally called
+ * "Aircon Servicing Singapore", an SEO heading every firm in the trade shares.
+ * Both cases fall back to the domain, which is what the owner registered and so
+ * closer to what they call themselves.
+ */
+export function displayCompanyName(
+  name: string,
+  domain: string | null | undefined,
+  industry?: string,
+): string | null {
+  const words = name.toLowerCase().split(/[\s,/&-]+/).filter(Boolean);
+  const allHeading = words.length > 0 && words.every((w) => HEADING_WORDS.has(w));
+  const isArticle = words.length >= 4 && ARTICLE_TITLE.test(name);
+
+  // A name is generic only when NOTHING distinctive is left once the trade and
+  // the filler words are removed.
+  //
+  // The looser test — "the name contains the industry" — was measured over the
+  // whole database and was badly wrong. It wanted to rename "24Hrs Florist" to
+  // "24hrscityflorist", "Kong Dental Clinic & Surgery" to "Kong Dental", and
+  // "Hershey's Chocolate World" to "Rwsentosa", which is the shopping centre
+  // the shop sits in. Containing the word "florist" does not make a florist's
+  // name generic; being nothing BUT the word florist does.
+  const FILLER = /\b(pte|ltd|llp|limited|singapore|sg|the|and|co|company|services?|servicing|in|of|for|general|best|top|professional|expert|specialists?)\b/g;
+
+  // Stemmed, because the unstemmed comparison left ten different corporate gift
+  // companies all called "Corporate Gifts Singapore": the industry is "corporate
+  // gifting", the name says "gifts", and "gifts" is not "gifting" to a string
+  // comparison. Crude suffix stripping is enough — this only has to tell a
+  // trade word from a brand name.
+  const stem = (w: string) => {
+    for (const suffix of ["ings", "ing", "ers", "er", "ies", "es", "s"]) {
+      if (w.length > suffix.length + 2 && w.endsWith(suffix)) return w.slice(0, -suffix.length);
+    }
+    return w;
+  };
+  const distinctive = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(FILLER, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(stem);
+
+  const indWords = new Set(industry ? distinctive(industry) : []);
+  const leftover = distinctive(name).filter((w) => !indWords.has(w));
+
+  const genericForTrade = indWords.size > 0 && leftover.length === 0;
+
+  if (!allHeading && !genericForTrade && !isArticle) return name;
+  if (!domain) return null;
+
+  // The domain is only an improvement if it says something the old name did
+  // not. A domain that reduces to the trade itself is no better than the
+  // heading it would replace.
+  const derived = nameFromDomain(domain);
+  const derivedLeft = distinctive(derived).filter((w) => !indWords.has(w));
+  if (indWords.size > 0 && derivedLeft.length === 0) return null;
+  return derived;
+}
+
+/** Mailbox words that are a function, not a person. */
+const MAILBOX_WORDS =
+  /^(info|enquir(y|ies)|inquiry|contact|sales|support|prosupport|admin|office|hello|hi|help|service|services|feedback|marketing|general|team|mail|email|ask|booking|bookings|customerservice|cs|reception)$/i;
+
+/**
+ * Is there a real person behind this contact, or just a shared mailbox?
+ *
+ * This matters more here than it looks. Contact names are derived from the
+ * email local part or the page title, so the stored "full name" for a Singapore
+ * aircon firm is routinely "prosupport", "feedback", "chanbro",
+ * "airconexpresssg" or "Coolaircon (hello)". The outreach writer took the first
+ * word of that and greeted people with "Hi Bond," and would have written "Hi
+ * feedback," — worse than not using a name at all, because it proves nobody
+ * looked.
+ *
+ * It is also not an edge case. Across 841 companies collected, exactly zero
+ * publish a named member of staff. A role inbox is the normal case in this
+ * market, so "Hi there," is the normal correct greeting.
+ */
+export function isRoleInbox(
+  fullName: string | null | undefined,
+  jobTitle: string | null | undefined,
+  companyName?: string | null,
+): boolean {
+  if (!fullName?.trim()) return true;
+  if (!jobTitle || /^general enquiries$/i.test(jobTitle)) return true;
+
+  const name = fullName.trim();
+  // "Coldway Aircon: Home (hello)" — the parenthesis is the mailbox it came from.
+  if (/[(:]/.test(name)) return true;
+
+  const words = name.split(/\s+/);
+  // A single token is a handle, not a name. Real names have a space.
+  if (words.length === 1) return true;
+  if (words.some((w) => MAILBOX_WORDS.test(w))) return true;
+
+  if (companyName) {
+    const flat = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (flat(name).includes(flat(companyName)) || flat(companyName).includes(flat(name))) return true;
+  }
+  return false;
+}
+
+/**
  * The company's name, from a page title or SERP title, falling back to the
  * domain when the title is furniture or marketing copy.
  */

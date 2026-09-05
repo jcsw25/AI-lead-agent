@@ -30,7 +30,19 @@
     "lint:bytes": "tsx scripts/lint-bytes.ts",
     "replies": "tsx scripts/poll-replies.ts",
     "selftest": "tsx scripts/self-test.ts",
-    "probe": "tsx scripts/draft-probes.ts"
+    "probe": "tsx scripts/draft-probes.ts",
+    "extract": "tsx scripts/extract-replies.ts",
+    "test:extract": "tsx scripts/test-extract.ts",
+    "test:wiring": "tsx scripts/test-extract-wiring.ts",
+    "test:category": "tsx scripts/test-category.ts",
+    "listings": "tsx scripts/scrape-listings.ts",
+    "test:acquisition": "tsx scripts/test-acquisition-tone.ts",
+    "test:tone": "tsx scripts/test-tone.ts",
+    "calls:sync": "tsx scripts/sync-calls.ts",
+    "clean": "tsx scripts/clean-data.ts",
+    "fill:pairings": "tsx scripts/fill-pairings.ts",
+    "leaks": "tsx scripts/backfill-leaks.ts",
+    "serp": "tsx scripts/backfill-serp.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.122.0",

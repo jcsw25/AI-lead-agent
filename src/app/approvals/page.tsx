@@ -1,11 +1,13 @@
 import { db } from "@/lib/db";
 import { currentBusiness } from "@/lib/business";
 import { hasApiKey } from "@/agents/runtime";
-import { approveAndSend, discardDraft, draftMore, regenerate, saveDraft } from "./actions";
+import { checkDraft } from "@/lib/outreach/quality";
+import QuickEmail, { type Draft } from "./QuickEmail";
+import { draftMore } from "./actions";
 
 export const dynamic = "force-dynamic";
 
-export default async function ApprovalsPage({
+export default async function QuickEmailPage({
   searchParams,
 }: {
   searchParams: Promise<{ status?: string }>;
@@ -13,190 +15,121 @@ export default async function ApprovalsPage({
   const { status = "DRAFT" } = await searchParams;
 
   // DRAFT and PENDING_APPROVAL mean the same thing to a human: written, not
-  // sent, waiting to be read. Two writers picked different values for it, so
-  // four finished emails sat in the database invisible to this page. Treated as
-  // one bucket rather than renaming a status other code already depends on.
+  // sent, waiting to be read. Two writers picked different values, so finished
+  // emails sat invisible to this page. Treated as one bucket rather than
+  // renaming a status other code depends on.
   const AWAITING = ["DRAFT", "PENDING_APPROVAL"] as const;
   const statusFilter = status === "DRAFT" ? { in: [...AWAITING] } : { equals: status };
   const business = await currentBusiness();
   if (!business) return <p>Run <code>npm run db:seed</code> first.</p>;
 
   const policy = await db.sendPolicy.findUnique({ where: { businessId: business.id } });
-  const adapter = process.env.EMAIL_ADAPTER ?? "mock";
-  const isMock = adapter === "mock";
+  const isMock = (process.env.EMAIL_ADAPTER ?? "mock") === "mock";
 
-  const [messages, counts, awaiting] = await Promise.all([
+  const [messages, counts, sentToday] = await Promise.all([
     db.message.findMany({
-      where: { businessId: business.id, direction: "OUTBOUND", status: statusFilter as never },
+      where: { businessId: business.id, direction: "OUTBOUND", status: statusFilter as never, parentMessageId: null },
       orderBy: { createdAt: "desc" },
-      take: 40,
+      take: 120,
       include: {
-        contact: { include: { company: { select: { id: true, name: true, industry: true, websiteUrl: true } } } },
-        introduction: {
-          include: { pairing: { select: { buyerIndustry: true, typicalDealLow: true, typicalDealHigh: true } } },
-        },
+        contact: { include: { company: { select: { name: true, industry: true, websiteUrl: true, pinnedForEmailAt: true } } } },
+        introduction: { include: { pairing: { select: { buyerIndustry: true } } } },
       },
     }),
+    // Top-level messages only. Counting follow-ups here made the header say
+    // "177 waiting" beside a list of 62 — the same page disagreeing with
+    // itself, because a follow-up is not a thing you review and send.
     db.message.groupBy({
       by: ["status"],
-      where: { businessId: business.id, direction: "OUTBOUND" },
+      where: { businessId: business.id, direction: "OUTBOUND", parentMessageId: null },
       _count: { _all: true },
     }),
-    db.introduction.findMany({
-      where: { businessId: business.id, outreachMessageId: null, status: { in: ["PROPOSED", "APPROVED"] } },
-      select: { companyAId: true },
-      distinct: ["companyAId"],
+    db.sendLedgerEntry.count({
+      where: { businessId: business.id, sentAt: { gte: new Date(Date.now() - 864e5) } },
     }),
   ]);
 
   const byStatus = Object.fromEntries(counts.map((c) => [c.status, c._count._all]));
-  const awaitingCount = (byStatus.DRAFT ?? 0) + (byStatus.PENDING_APPROVAL ?? 0);
-  const sentToday = await db.sendLedgerEntry.count({
-    where: { businessId: business.id, sentAt: { gte: new Date(Date.now() - 864e5) } },
-  });
+  const awaiting = (byStatus.DRAFT ?? 0) + (byStatus.PENDING_APPROVAL ?? 0);
+
+  // The same mechanical checks the writer is held to, run here so a flagged
+  // draft cannot look identical to a clean one in the list.
+  const drafts: Draft[] = messages.map((m) => ({
+    id: m.id,
+    subject: m.subject ?? "",
+    body: m.bodyText ?? "",
+    company: m.contact?.company.name ?? "unknown company",
+    email: m.contact?.email ?? null,
+    industry: m.contact?.company.industry ?? null,
+    websiteUrl: m.contact?.company.websiteUrl ?? null,
+    words: (m.bodyText ?? "").split(/\s+/).filter(Boolean).length,
+    status: m.status,
+    blockedReason: m.blockedReason,
+    violations: checkDraft(m.subject ?? "", m.bodyText ?? "").map((v) => v.detail),
+    pitching: m.introduction?.pairing?.buyerIndustry ?? null,
+    pinned: Boolean(m.contact?.company.pinnedForEmailAt),
+  }))
+    // A pin from the Leaks page is a human decision about what matters today,
+    // so it outranks recency.
+    .sort((a, b) => Number(b.pinned) - Number(a.pinned));
 
   return (
     <>
       <div className="page-head">
         <p className="eyebrow">Outreach · nothing sends without you</p>
-        <h1>Approval queue</h1>
+        <h1>Quick Email</h1>
         <p className="sub">
-          One email per supplier, covering every buyer they were matched to. Read it, edit it if you want, then
-          send. Every send also passes the compliance gate — sender identity, suppression list, and the Spam
-          Control Act bulk thresholds.
+          Read one, send one. Every send passes the compliance gate — sender identity, suppression list, and the
+          Spam Control Act bulk thresholds — and approving sends immediately, so the read is the safeguard.
         </p>
       </div>
 
       {isMock && (
         <div className="notice" style={{ marginBottom: "1rem" }}>
-          <strong>Nothing can actually leave this machine yet.</strong> <code>EMAIL_ADAPTER</code> is{" "}
-          <code>mock</code>, so &ldquo;send&rdquo; records the message and returns a fake id. Set{" "}
-          <code>EMAIL_ADAPTER=resend</code> and <code>RESEND_API_KEY</code> in <code>.env</code> to send for real.
+          <strong>Nothing can leave this machine yet.</strong> <code>EMAIL_ADAPTER</code> is <code>mock</code>, so
+          approving records the message and returns a fake id.
         </div>
       )}
-
       {!policy?.senderContactEmail && (
         <div className="notice" style={{ marginBottom: "1rem" }}>
-          <strong>No reply-to address set.</strong> The gate will block every send until one is configured — a
-          working contact address is a legal requirement on commercial email, not a nicety.
+          <strong>No reply-to address set.</strong> The gate blocks every send until one is configured — a working
+          contact address is a legal requirement on commercial email, not a nicety.
         </div>
       )}
 
-      <div className="stats" style={{ marginBottom: "1.25rem" }}>
-        <div className="stat"><span className="v">{awaitingCount}</span><span className="l">Awaiting review</span></div>
+      <div className="stats" style={{ marginBottom: "1rem" }}>
+        <div className="stat"><span className="v">{awaiting}</span><span className="l">Waiting to be read</span></div>
         <div className="stat good"><span className="v">{byStatus.SENT ?? 0}</span><span className="l">Sent</span></div>
         <div className="stat"><span className="v">{byStatus.BLOCKED_BY_GATE ?? 0}</span><span className="l">Blocked</span></div>
-        <div className="stat"><span className="v">{awaiting.length}</span><span className="l">Suppliers not yet drafted</span></div>
+        <div className="stat">
+          <span className="v">{sentToday}</span>
+          <span className="l">Sent in 24h of {policy?.bulkPer24h ?? 100}</span>
+        </div>
       </div>
 
-      <p className="muted" style={{ fontSize: "0.84rem", marginTop: "-0.75rem" }}>
-        Sending as <strong>{policy?.senderName}</strong> &lt;{policy?.senderContactEmail}&gt; · {sentToday} sent in
-        the last 24h of a {policy?.bulkPer24h ?? 100} bulk threshold. Past that, every message needs an{" "}
-        <code>&lt;ADV&gt;</code> subject prefix by law.
+      <p className="muted" style={{ fontSize: "0.82rem", marginTop: "-0.5rem" }}>
+        Sending as <strong>{policy?.senderName}</strong> &lt;{policy?.senderContactEmail}&gt;. Past the{" "}
+        {policy?.bulkPer24h ?? 100} threshold every message needs an <code>&lt;ADV&gt;</code> subject prefix by law.
       </p>
 
-      <div className="lane-head" style={{ marginTop: "1.5rem" }}>
+      <div className="lane-head" style={{ marginTop: "1.25rem" }}>
         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
           {["DRAFT", "SENT", "BLOCKED_BY_GATE", "CANCELLED"].map((s) => (
             <a key={s} href={`/approvals?status=${s}`} className={s === status ? "chip on" : "chip"}>
-              {s === "DRAFT" ? "awaiting review" : s.toLowerCase().replace(/_/g, " ")}{" "}
-              ({s === "DRAFT" ? awaitingCount : (byStatus[s] ?? 0)})
+              {s === "DRAFT" ? "waiting" : s.toLowerCase().replace(/_/g, " ")}{" "}
+              ({s === "DRAFT" ? awaiting : byStatus[s] ?? 0})
             </a>
           ))}
         </div>
-        {hasApiKey() && awaiting.length > 0 && (
+        {hasApiKey() && (
           <form action={draftMore.bind(null, business.id)} style={{ display: "flex", gap: "0.4rem" }}>
             <input type="hidden" name="limit" value="5" />
-            <button type="submit">Draft 5 more</button>
+            <button type="submit" className="ghost">Draft 5 more</button>
           </form>
         )}
       </div>
 
-      {messages.length === 0 ? (
-        <div className="empty">
-          <h3>Nothing here</h3>
-          <p>
-            {status === "DRAFT" && awaiting.length > 0
-              ? `${awaiting.length} suppliers have an introduction but no email yet.`
-              : "No messages with this status."}
-          </p>
-        </div>
-      ) : (
-        <div style={{ display: "grid", gap: "1rem" }}>
-          {messages.map((m) => {
-            const company = m.contact?.company;
-            const deal = m.introduction?.pairing;
-            return (
-              <div key={m.id} className="panel">
-                <div style={{ display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
-                  <div>
-                    <strong>{company?.name ?? "unknown company"}</strong>
-                    <div className="muted" style={{ fontSize: "0.8rem" }}>
-                      {m.contact?.email} · {company?.industry}
-                      {company?.websiteUrl && (
-                        <>
-                          {" · "}
-                          <a href={company.websiteUrl} target="_blank" rel="noopener noreferrer">site</a>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                  {deal && (
-                    <div className="muted" style={{ fontSize: "0.78rem", textAlign: "right" }}>
-                      pitching: {deal.buyerIndustry}
-                      {deal.typicalDealLow && deal.typicalDealHigh && (
-                        <div>deals ${Number(deal.typicalDealLow).toFixed(0)}–{Number(deal.typicalDealHigh).toFixed(0)}</div>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {m.blockedReason && (
-                  <p className="notice" style={{ marginTop: "0.75rem", fontSize: "0.85rem" }}>
-                    <strong>Blocked:</strong> {m.blockedReason}
-                  </p>
-                )}
-
-                {m.status === "DRAFT" || m.status === "PENDING_APPROVAL" || m.status === "BLOCKED_BY_GATE" ? (
-                  <form action={saveDraft.bind(null, business.id)} style={{ marginTop: "0.75rem" }}>
-                    <input type="hidden" name="id" value={m.id} />
-                    <label style={{ display: "block", fontSize: "0.78rem" }} className="muted">Subject</label>
-                    <input name="subject" defaultValue={m.subject ?? ""} style={{ width: "100%" }} />
-                    <label style={{ display: "block", fontSize: "0.78rem", marginTop: "0.5rem" }} className="muted">Body</label>
-                    <textarea name="bodyText" defaultValue={m.bodyText ?? ""} rows={12} style={{ width: "100%", fontFamily: "inherit" }} />
-                    <button type="submit" className="ghost" style={{ marginTop: "0.5rem" }}>Save edits</button>
-                  </form>
-                ) : (
-                  <>
-                    <p style={{ marginTop: "0.75rem" }}><strong>{m.subject}</strong></p>
-                    <pre style={{ whiteSpace: "pre-wrap", fontFamily: "inherit", fontSize: "0.88rem" }}>{m.bodyText}</pre>
-                    {m.sentAt && <p className="muted" style={{ fontSize: "0.78rem" }}>Sent {m.sentAt.toLocaleString()}</p>}
-                  </>
-                )}
-
-                {(m.status === "DRAFT" || m.status === "PENDING_APPROVAL" || m.status === "BLOCKED_BY_GATE") && (
-                  <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.75rem", flexWrap: "wrap" }}>
-                    <form action={approveAndSend.bind(null, business.id)}>
-                      <input type="hidden" name="id" value={m.id} />
-                      <button type="submit">{isMock ? "Approve (mock send)" : "Approve and send"}</button>
-                    </form>
-                    {hasApiKey() && (
-                      <form action={regenerate.bind(null, business.id)}>
-                        <input type="hidden" name="id" value={m.id} />
-                        <button type="submit" className="ghost">Rewrite</button>
-                      </form>
-                    )}
-                    <form action={discardDraft.bind(null, business.id)}>
-                      <input type="hidden" name="id" value={m.id} />
-                      <button type="submit" className="ghost">Discard</button>
-                    </form>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
+      <QuickEmail businessId={business.id} drafts={drafts} isMock={isMock} />
     </>
   );
 }

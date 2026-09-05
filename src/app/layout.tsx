@@ -23,10 +23,24 @@ export const metadata: Metadata = {
  */
 const ESSENTIAL = [
   { href: "/generator", label: "Generator", hint: "find and scrape companies" },
+  { href: "/leaks-view", label: "Leaks", hint: "traffic they are losing — who to pitch first" },
   { href: "/needs", label: "Needs", hint: "what buyers said they want" },
-  { href: "/matchmake", label: "Matchmake", hint: "who should meet whom" },
-  { href: "/approvals", label: "Approvals", hint: "read it, then send it" },
+  { href: "/pairings", label: "Pairings", hint: "two companies, and why they should meet" },
+  { href: "/approvals", label: "Quick Email", hint: "read one, send one" },
+  { href: "/calls", label: "Calls", hint: "the phone lane — 1,334 numbers" },
   { href: "/replies", label: "Replies", hint: "what came back" },
+];
+
+/**
+ * The second business, in its own group rather than folded into the list above.
+ *
+ * It is not the same job. Everything in ESSENTIAL earns a commission on
+ * somebody else's transaction; this one buys the company. The pipeline, the ask
+ * and the timescale all differ, and one flat list would imply an acquisition
+ * target and a sales lead are the same kind of thing.
+ */
+const ACQUISITION = [
+  { href: "/acquisitions", label: "Acquisitions", hint: "businesses to buy — advertised and off-market" },
 ];
 
 const SYSTEM = [
@@ -38,7 +52,7 @@ const PARKED = [
   { href: "/qualified", label: "Qualified", hint: "scoring detail; Needs already ranks by grade" },
   { href: "/introductions", label: "Introductions", hint: "fills once a need is confirmed" },
   { href: "/", label: "Opportunity Centre", hint: "original dashboard" },
-  { href: "/pairings", label: "Pairings", hint: "managed automatically now" },
+  { href: "/industry-pairings", label: "Industry pairings", hint: "the A-to-B theses; managed automatically now" },
   { href: "/industries", label: "Industries", hint: "superseded by the query strategist" },
   { href: "/prospects", label: "Prospects", hint: "superseded by Needs" },
   { href: "/outreach", label: "Outreach", hint: "superseded by Approvals" },
@@ -60,6 +74,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
             <nav className="nav">
               {ESSENTIAL.map((l) => (
+                <Link key={l.href} href={l.href} title={l.hint}>
+                  {l.label}
+                </Link>
+              ))}
+
+              <div className="nav-group">Acquisition</div>
+              {ACQUISITION.map((l) => (
                 <Link key={l.href} href={l.href} title={l.hint}>
                   {l.label}
                 </Link>
